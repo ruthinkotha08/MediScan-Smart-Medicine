@@ -1,5 +1,5 @@
 streamlit>=1.40,<2.0
-openai
-pillow
 opencv-python-headless
 numpy
+pillow
+pytesseract
