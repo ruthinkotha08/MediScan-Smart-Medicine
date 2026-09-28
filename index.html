@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MediScan — Smart Medicine Verification</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="https://unpkg.com/html5-qrcode" defer></script>
+  <script src="script.js" defer></script>
+</head>
+<body>
+<header>
+  <div class="brand"><span class="logo">✚</span> MediScan</div>
+  <nav>
+    <a href="#scanner">Scan</a>
+    <a href="#about">How it works</a>
+    <a href="#cabinet">My Medicines</a>
+  </nav>
+</header>
+
+<main>
+  <section class="hero">
+    <div>
+      <p class="eyebrow">SMART MEDICINE SAFETY</p>
+      <h1>Scan. Verify. Understand.</h1>
+      <p class="hero-text">Scan a medicine QR code to view product information, manufacturing and expiry dates, batch details, safety notes, and a simple explanation of its general use.</p>
+      <a class="primary-btn" href="#scanner">Scan Medicine QR</a>
+    </div>
+    <div class="hero-card">
+      <div class="shield">✓</div>
+      <h3>Medicine at a glance</h3>
+      <p>Expiry • Batch • Manufacturer • General use • Warnings</p>
+    </div>
+  </section>
+
+  <section id="scanner" class="panel">
+    <div class="section-title">
+      <p class="eyebrow">STEP 01</p>
+      <h2>Scan a medicine</h2>
+      <p>For this prototype, you can scan a demo QR code containing a product ID.</p>
+    </div>
+    <div id="reader"></div>
+    <div class="demo-controls">
+      <button class="secondary-btn" onclick="showDemo('MED001')">Demo: Medicine A</button>
+      <button class="secondary-btn" onclick="showDemo('MED002')">Demo: Medicine B</button>
+      <button class="secondary-btn" onclick="showDemo('MED003')">Demo: Expired</button>
+    </div>
+    <p id="scan-message" class="muted"></p>
+  </section>
+
+  <section id="result" class="panel hidden">
+    <div class="result-head">
+      <div>
+        <p class="eyebrow">VERIFIED PRODUCT RECORD</p>
+        <h2 id="medicine-name">Medicine</h2>
+      </div>
+      <span id="status-badge" class="badge">VALID</span>
+    </div>
+    <div class="grid">
+      <div class="info-card"><span>Active ingredient</span><strong id="ingredient">—</strong></div>
+      <div class="info-card"><span>Manufacturer</span><strong id="manufacturer">—</strong></div>
+      <div class="info-card"><span>Manufacturing date</span><strong id="mfg">—</strong></div>
+      <div class="info-card"><span>Expiry date</span><strong id="expiry">—</strong></div>
+      <div class="info-card"><span>Batch number</span><strong id="batch">—</strong></div>
+      <div class="info-card"><span>Dosage form</span><strong id="form">—</strong></div>
+    </div>
+
+    <div class="explain-box">
+      <h3>What is it generally used for?</h3>
+      <p id="use">—</p>
+    </div>
+
+    <div class="warning-box">
+      <h3>⚠ Safety information</h3>
+      <p id="warning">—</p>
+    </div>
+
+    <div class="actions">
+      <button class="primary-btn" onclick="addToCabinet()">Add to My Medicines</button>
+      <button class="secondary-btn" onclick="window.print()">Print report</button>
+    </div>
+    <p class="disclaimer">MediScan provides informational product details and does not diagnose conditions or replace a prescription or qualified healthcare professional's advice.</p>
+  </section>
+
+  <section id="about" class="features">
+    <div class="section-title">
+      <p class="eyebrow">THE IDEA</p>
+      <h2>From a QR code to useful information</h2>
+    </div>
+    <div class="feature-grid">
+      <article><div class="icon">⌁</div><h3>QR identification</h3><p>Read a product or batch identifier from a QR code.</p></article>
+      <article><div class="icon">✓</div><h3>Expiry verification</h3><p>Automatically compare the expiry date with today's date.</p></article>
+      <article><div class="icon">AI</div><h3>Simple explanation</h3><p>Present pharmaceutical information in language a normal user can understand.</p></article>
+      <article><div class="icon">!</div><h3>Safety alerts</h3><p>Highlight expired products and important label warnings.</p></article>
+    </div>
+  </section>
+
+  <section id="cabinet" class="panel">
+    <div class="section-title">
+      <p class="eyebrow">STEP 02</p>
+      <h2>My Medicines</h2>
+      <p>Saved medicines are kept locally in this prototype.</p>
+    </div>
+    <div id="cabinet-list" class="cabinet-list">
+      <p class="muted">No medicines saved yet. Scan a medicine and add it here.</p>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <p><strong>MediScan</strong> — Smart Medicine Verification Prototype</p>
+  <p>For educational/demo use. Product records in this prototype are sample data.</p>
+</footer>
+</body>
+</html>
