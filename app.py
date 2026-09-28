@@ -1,13 +1,15 @@
 import streamlit as st
+import base64
+import json
+import re
 import cv2
 import numpy as np
-import pytesseract
-import re
+from openai import OpenAI
 from PIL import Image
-from datetime import datetime
+
 
 # =========================================================
-# PAGE
+# PAGE CONFIGURATION
 # =========================================================
 
 st.set_page_config(
@@ -20,13 +22,31 @@ st.title("💊 MediScan")
 st.subheader("Scan. Verify. Understand.")
 
 st.write(
-    "Take a clear photo of a medicine strip. "
-    "MediScan will extract the information printed on it."
+    "Take a photo of a medicine strip and MediScan will "
+    "extract the information printed on the package."
 )
 
 
 # =========================================================
-# QR CODE
+# OPENAI
+# =========================================================
+
+try:
+    OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
+
+except Exception:
+    st.error(
+        "OPENAI_API_KEY is not configured."
+    )
+    st.stop()
+
+client = OpenAI(
+    api_key=OPENAI_API_KEY
+)
+
+
+# =========================================================
+# QR CODE DETECTION
 # =========================================================
 
 def detect_qr(image):
@@ -49,484 +69,245 @@ def detect_qr(image):
 
 
 # =========================================================
-# IMAGE PREPROCESSING
+# IMAGE → BASE64
 # =========================================================
 
-def preprocess_image(image):
+def image_to_base64(image):
 
-    img = np.array(image)
+    # Convert image to JPEG
+    from io import BytesIO
 
-    # RGB → BGR
-    img = cv2.cvtColor(
-        img,
-        cv2.COLOR_RGB2BGR
+    buffer = BytesIO()
+
+    image.convert("RGB").save(
+        buffer,
+        format="JPEG",
+        quality=95
     )
 
-    # Make small letters bigger
-    img = cv2.resize(
-        img,
-        None,
-        fx=2.5,
-        fy=2.5,
-        interpolation=cv2.INTER_CUBIC
-    )
+    image_bytes = buffer.getvalue()
 
-    # Grayscale
-    gray = cv2.cvtColor(
-        img,
-        cv2.COLOR_BGR2GRAY
-    )
+    encoded = base64.b64encode(
+        image_bytes
+    ).decode("utf-8")
 
-    # Improve contrast
-    clahe = cv2.createCLAHE(
-        clipLimit=2.0,
-        tileGridSize=(8, 8)
-    )
-
-    enhanced = clahe.apply(gray)
-
-    # Remove small noise
-    blurred = cv2.GaussianBlur(
-        enhanced,
-        (3, 3),
-        0
-    )
-
-    # Threshold
-    threshold = cv2.adaptiveThreshold(
-        blurred,
-        255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY,
-        31,
-        11
-    )
-
-    return [
-        enhanced,
-        threshold
-    ]
+    return encoded
 
 
 # =========================================================
-# OCR
+# AI MEDICINE READER
 # =========================================================
 
-def run_ocr(image):
+def analyze_medicine_image(image):
 
-    processed_images = preprocess_image(image)
+    image_base64 = image_to_base64(image)
 
-    all_text = []
+    prompt = """
+You are analyzing a photograph of a medicine package or medicine strip.
 
-    for img in processed_images:
+Read ONLY information that is actually visible in the image.
 
-        for angle in [0, 90, 180, 270]:
+Do NOT guess missing information.
 
-            if angle == 0:
-                rotated = img
+Return ONLY valid JSON using exactly these fields:
 
-            elif angle == 90:
-                rotated = cv2.rotate(
-                    img,
-                    cv2.ROTATE_90_CLOCKWISE
-                )
+{
+  "medicine_name": "",
+  "active_ingredient": "",
+  "strength": "",
+  "dosage_form": "",
+  "manufacturer": "",
+  "batch_number": "",
+  "manufacturing_date": "",
+  "expiry_date": "",
+  "mrp": "",
+  "general_use_printed": "",
+  "confidence": ""
+}
 
-            elif angle == 180:
-                rotated = cv2.rotate(
-                    img,
-                    cv2.ROTATE_180
-                )
+Rules:
 
-            else:
-                rotated = cv2.rotate(
-                    img,
-                    cv2.ROTATE_90_COUNTERCLOCKWISE
-                )
+1. Read the medicine/brand name carefully.
+2. Read the active ingredient if visible.
+3. Read the strength such as 2.5 mg or 500 mg.
+4. Identify the dosage form if visible.
+5. Identify the manufacturer if visible.
+6. Read the batch number only if it is clearly visible.
+7. Read MFG/manufacturing date only if visible.
+8. Read EXP/expiry date only if visible.
+9. Read MRP only if visible.
+10. "general_use_printed" should contain information about use ONLY if such information is actually printed on the package. Do not provide medical advice.
+11. If something cannot be read, return "Not clearly visible".
+12. Do not invent values.
+13. Do not recommend whether a person should take the medicine.
+14. Keep the answer concise.
+15. "confidence" should be one of:
+    "High", "Medium", or "Low".
+"""
 
-            # OCR mode 6
-            text1 = pytesseract.image_to_string(
-                rotated,
-                config="--psm 6"
-            )
-
-            # OCR mode 11
-            text2 = pytesseract.image_to_string(
-                rotated,
-                config="--psm 11"
-            )
-
-            all_text.append(text1)
-            all_text.append(text2)
-
-    return "\n".join(all_text)
-
-
-# =========================================================
-# CLEAN OCR TEXT
-# =========================================================
-
-def clean_text(text):
-
-    text = text.replace("|", "I")
-
-    text = re.sub(
-        r"[ \t]+",
-        " ",
-        text
-    )
-
-    return text
-
-
-# =========================================================
-# MEDICINE NAME
-# =========================================================
-
-def find_medicine_name(text):
-
-    lines = [
-        line.strip()
-        for line in text.splitlines()
-        if line.strip()
-    ]
-
-    candidates = []
-
-    for line in lines:
-
-        upper = line.upper()
-
-        # Skip common non-name lines
-        skip_words = [
-            "COMPOSITION",
-            "MANUFACTURED",
-            "MANUFACTURER",
-            "WARNING",
-            "CAUTION",
-            "STORAGE",
-            "DOSAGE",
-            "BATCH",
-            "MFG",
-            "MFD",
-            "EXP",
-            "EXPIRY",
-            "MRP",
-            "TABLETS IP",
-            "TABLETS USP",
-            "CAPSULES IP",
-            "CAPSULES USP",
-            "EACH FILM",
-            "INDIA"
+    response = client.responses.create(
+        model="gpt-5.6-luna",
+        input=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": prompt
+                    },
+                    {
+                        "type": "input_image",
+                        "image_url": (
+                            "data:image/jpeg;base64,"
+                            + image_base64
+                        ),
+                        "detail": "high"
+                    }
+                ]
+            }
         ]
-
-        if any(word in upper for word in skip_words):
-            continue
-
-        # Strong signal:
-        # Medicine name often contains dosage
-        if re.search(
-            r"\b\d+\s*(MG|MCG|G|ML)\b",
-            upper
-        ):
-            candidates.append(line)
-
-    if candidates:
-        # Prefer shorter, cleaner candidate
-        candidates.sort(
-            key=lambda x: len(x)
-        )
-
-        return candidates[0]
-
-    return "Not detected"
-
-
-# =========================================================
-# COMPOSITION
-# =========================================================
-
-def find_composition(text):
-
-    upper = text.upper()
-
-    patterns = [
-
-        r"COMPOSITION[:\s]+(.{10,120})",
-
-        r"CONTAINS[:\s]+(.{10,120})",
-
-        r"Each\s+tablet.*?contains[:\s]+(.{10,120})"
-
-    ]
-
-    for pattern in patterns:
-
-        match = re.search(
-            pattern,
-            upper,
-            re.IGNORECASE
-        )
-
-        if match:
-
-            value = match.group(1)
-
-            value = value.split("\n")[0]
-
-            return value.strip()
-
-    # Specific useful detection
-    if "CIPROFLOXACIN" in upper:
-
-        match = re.search(
-            r"CIPROFLOXACIN.{0,80}",
-            upper
-        )
-
-        if match:
-            return match.group(0).strip()
-
-    return "Not detected"
-
-
-# =========================================================
-# MANUFACTURER
-# =========================================================
-
-def find_manufacturer(text):
-
-    upper = text.upper()
-
-    patterns = [
-
-        r"MANUFACTURED\s+BY[:\s]+([A-Z][A-Z &.,'-]{3,80})",
-
-        r"MANUFACTURER[:\s]+([A-Z][A-Z &.,'-]{3,80})",
-
-        r"MARKETED\s+BY[:\s]+([A-Z][A-Z &.,'-]{3,80})"
-
-    ]
-
-    for pattern in patterns:
-
-        match = re.search(
-            pattern,
-            upper
-        )
-
-        if match:
-
-            value = match.group(1)
-
-            value = value.split("\n")[0]
-
-            return value.strip()
-
-    # Useful OCR correction for the uploaded example
-    if "CADILA" in upper:
-
-        return "CADILA Pharmaceuticals"
-
-    return "Not detected"
-
-
-# =========================================================
-# MFG / EXP DATE
-# =========================================================
-
-def find_dates(text):
-
-    upper = text.upper()
-
-    # Normalize common OCR mistakes
-    upper = upper.replace("0EC", "DEC")
-    upper = upper.replace("NOV.", "NOV")
-    upper = upper.replace("DEC.", "DEC")
-    upper = upper.replace("JAN.", "JAN")
-    upper = upper.replace("FEB.", "FEB")
-    upper = upper.replace("MAR.", "MAR")
-    upper = upper.replace("APR.", "APR")
-    upper = upper.replace("JUN.", "JUN")
-    upper = upper.replace("JUL.", "JUL")
-    upper = upper.replace("AUG.", "AUG")
-    upper = upper.replace("SEP.", "SEP")
-    upper = upper.replace("OCT.", "OCT")
-
-    months = (
-        "JAN|FEB|MAR|APR|MAY|JUN|"
-        "JUL|AUG|SEP|OCT|NOV|DEC"
     )
 
-    mfg_patterns = [
-        rf"(?:MFG|MFD|MFR|MANUFACTURED)"
-        rf"[\s.:/-]*({months})[\s./-]*(20\d{{2}})",
+    result = response.output_text.strip()
 
-        r"(?:MFG|MFD)[\s.:/-]*(\d{1,2})[\s./-](20\d{2})"
-    ]
-
-    exp_patterns = [
-        rf"(?:EXP|EXPIRY|EXPIRES)"
-        rf"[\s.:/-]*({months})[\s./-]*(20\d{{2}})",
-
-        r"(?:EXP|EXPIRY)[\s.:/-]*(\d{1,2})[\s./-](20\d{2})"
-    ]
-
-    mfg = None
-    exp = None
-
-    for pattern in mfg_patterns:
-
-        match = re.search(
-            pattern,
-            upper
-        )
-
-        if match:
-
-            mfg = " ".join(match.groups())
-            break
-
-    for pattern in exp_patterns:
-
-        match = re.search(
-            pattern,
-            upper
-        )
-
-        if match:
-
-            exp = " ".join(match.groups())
-            break
-
-    return mfg, exp
-
-
-# =========================================================
-# BATCH NUMBER
-# =========================================================
-
-def find_batch(text):
-
-    upper = text.upper()
-
-    patterns = [
-
-        r"(?:BATCH|BATCH NO|B\.NO|B NO)"
-        r"[\s.:/-]*([A-Z0-9/-]{3,30})",
-
-        r"(?:LOT|LOT NO)"
-        r"[\s.:/-]*([A-Z0-9/-]{3,30})"
-    ]
-
-    for pattern in patterns:
-
-        match = re.search(
-            pattern,
-            upper
-        )
-
-        if match:
-
-            value = match.group(1)
-
-            # Avoid returning just a date
-            if not re.fullmatch(
-                r"\d{1,2}[/-]\d{4}",
-                value
-            ):
-
-                return value.strip()
-
-    return "Not detected"
-
-
-# =========================================================
-# MRP
-# =========================================================
-
-def find_mrp(text):
-
-    upper = text.upper()
-
-    patterns = [
-
-        r"(?:M\.?R\.?P\.?|MRP)"
-        r"[\s.:/-]*(?:RS\.?|₹)?"
-        r"\s*(\d+(?:\.\d{1,2})?)",
-
-        r"(?:RS\.?|₹)"
-        r"\s*(\d+(?:\.\d{1,2})?)"
-    ]
-
-    for pattern in patterns:
-
-        match = re.search(
-            pattern,
-            upper
-        )
-
-        if match:
-
-            return "₹" + match.group(1)
-
-    return "Not detected"
-
-
-# =========================================================
-# EXPIRY STATUS
-# =========================================================
-
-def expiry_status(expiry):
-
-    if not expiry:
-        return "⚪ Expiry not detected"
-
-    months = {
-        "JAN": 1,
-        "FEB": 2,
-        "MAR": 3,
-        "APR": 4,
-        "MAY": 5,
-        "JUN": 6,
-        "JUL": 7,
-        "AUG": 8,
-        "SEP": 9,
-        "OCT": 10,
-        "NOV": 11,
-        "DEC": 12
-    }
-
-    match = re.search(
-        r"(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)"
-        r"\s*(20\d{2})",
-        expiry.upper()
+    # Remove ```json if model adds it
+    result = re.sub(
+        r"^```json\s*",
+        "",
+        result,
+        flags=re.IGNORECASE
     )
 
-    if not match:
-        return "⚪ Could not determine expiry"
+    result = re.sub(
+        r"\s*```$",
+        "",
+        result
+    )
 
-    month = months[match.group(1)]
-    year = int(match.group(2))
+    return json.loads(result)
 
-    # Medicine expiry is considered through the end
-    # of the stated month.
-    if month == 12:
-        expiry_date = datetime(
-            year + 1,
-            1,
-            1
+
+# =========================================================
+# DISPLAY RESULT
+# =========================================================
+
+def display_result(data):
+
+    st.divider()
+
+    st.subheader(
+        "💊 Detected Medicine Information"
+    )
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+
+        st.write("**Medicine Name**")
+        st.info(
+            data.get(
+                "medicine_name",
+                "Not clearly visible"
+            )
         )
+
+        st.write("**Active Ingredient**")
+        st.info(
+            data.get(
+                "active_ingredient",
+                "Not clearly visible"
+            )
+        )
+
+        st.write("**Strength**")
+        st.info(
+            data.get(
+                "strength",
+                "Not clearly visible"
+            )
+        )
+
+        st.write("**Dosage Form**")
+        st.info(
+            data.get(
+                "dosage_form",
+                "Not clearly visible"
+            )
+        )
+
+        st.write("**Manufacturer**")
+        st.info(
+            data.get(
+                "manufacturer",
+                "Not clearly visible"
+            )
+        )
+
+    with col2:
+
+        st.write("**Batch Number**")
+        st.info(
+            data.get(
+                "batch_number",
+                "Not clearly visible"
+            )
+        )
+
+        st.write("**Manufacturing Date**")
+        st.info(
+            data.get(
+                "manufacturing_date",
+                "Not clearly visible"
+            )
+        )
+
+        st.write("**Expiry Date**")
+        st.info(
+            data.get(
+                "expiry_date",
+                "Not clearly visible"
+            )
+        )
+
+        st.write("**MRP**")
+        st.info(
+            data.get(
+                "mrp",
+                "Not clearly visible"
+            )
+        )
+
+    st.subheader("📌 Information Printed on Package")
+
+    st.write(
+        data.get(
+            "general_use_printed",
+            "Not clearly visible"
+        )
+    )
+
+    st.subheader("🔍 Reading Confidence")
+
+    confidence = data.get(
+        "confidence",
+        "Low"
+    )
+
+    if confidence == "High":
+        st.success("High confidence")
+
+    elif confidence == "Medium":
+        st.warning("Medium confidence")
+
     else:
-        expiry_date = datetime(
-            year,
-            month + 1,
-            1
-        )
+        st.warning("Low confidence")
 
-    if datetime.now() < expiry_date:
-        return "✅ NOT EXPIRED"
+    st.divider()
 
-    return "❌ EXPIRED"
+    st.info(
+        "ℹ️ Please verify the detected information "
+        "with the original medicine package."
+    )
 
 
 # =========================================================
@@ -538,23 +319,23 @@ st.divider()
 st.subheader("📷 Scan Medicine Strip")
 
 camera_photo = st.camera_input(
-    "Take a clear picture of the printed side"
+    "Take a clear picture of the medicine strip"
 )
 
 st.caption(
-    "For best results: keep the strip flat, "
-    "use good lighting and fill most of the camera frame."
+    "For best results, keep the printed side facing the camera "
+    "and use good lighting."
 )
 
 
 # =========================================================
-# UPLOAD
+# IMAGE UPLOAD
 # =========================================================
 
-st.subheader("🖼️ Or Upload an Image")
+st.subheader("🖼️ Or Upload a Medicine Image")
 
 uploaded_photo = st.file_uploader(
-    "Choose a medicine image",
+    "Choose an image",
     type=[
         "jpg",
         "jpeg",
@@ -562,11 +343,13 @@ uploaded_photo = st.file_uploader(
     ]
 )
 
+
+# Use camera photo first
 photo = camera_photo or uploaded_photo
 
 
 # =========================================================
-# PROCESS
+# PROCESS IMAGE
 # =========================================================
 
 if photo:
@@ -579,117 +362,8 @@ if photo:
         use_container_width=True
     )
 
-    with st.spinner(
-        "🔍 Reading medicine information..."
-    ):
-
-        qr_data = detect_qr(image)
-
-        extracted_text = run_ocr(image)
-
-        extracted_text = clean_text(
-            extracted_text
-        )
-
-        medicine_name = find_medicine_name(
-            extracted_text
-        )
-
-        composition = find_composition(
-            extracted_text
-        )
-
-        manufacturer = find_manufacturer(
-            extracted_text
-        )
-
-        mfg, exp = find_dates(
-            extracted_text
-        )
-
-        batch = find_batch(
-            extracted_text
-        )
-
-        mrp = find_mrp(
-            extracted_text
-        )
-
-    # =====================================================
-    # RESULTS
-    # =====================================================
-
-    st.divider()
-
-    st.subheader(
-        "💊 Detected Medicine Information"
-    )
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-
-        st.write(
-            "**Medicine Name**"
-        )
-
-        st.info(
-            medicine_name
-        )
-
-        st.write(
-            "**Composition**"
-        )
-
-        st.info(
-            composition
-        )
-
-        st.write(
-            "**Manufacturer**"
-        )
-
-        st.info(
-            manufacturer
-        )
-
-    with col2:
-
-        st.write(
-            "**Manufacturing Date**"
-        )
-
-        st.info(
-            mfg or "Not detected"
-        )
-
-        st.write(
-            "**Expiry Date**"
-        )
-
-        st.info(
-            exp or "Not detected"
-        )
-
-        st.write(
-            "**Batch Number**"
-        )
-
-        st.info(
-            batch
-        )
-
-        st.write(
-            "**MRP**"
-        )
-
-        st.info(
-            mrp
-        )
-
-    # =====================================================
-    # QR
-    # =====================================================
+    # QR check
+    qr_data = detect_qr(image)
 
     if qr_data:
 
@@ -697,47 +371,34 @@ if photo:
             f"📱 QR Code detected: {qr_data}"
         )
 
-    # =====================================================
-    # EXPIRY
-    # =====================================================
-
-    st.subheader(
-        "📅 Expiry Status"
-    )
-
-    status = expiry_status(exp)
-
-    if "NOT EXPIRED" in status:
-
-        st.success(status)
-
-    elif "EXPIRED" in status:
-
-        st.error(status)
-
-    else:
-
-        st.warning(status)
-
-    # =====================================================
-    # OCR TEXT
-    # =====================================================
-
-    with st.expander(
-        "🔎 View OCR text"
+    # AI analysis
+    with st.spinner(
+        "🤖 AI is reading the medicine package..."
     ):
 
-        st.text(
-            extracted_text
-        )
+        try:
 
-    # =====================================================
-    # DISCLAIMER
-    # =====================================================
+            medicine_data = analyze_medicine_image(
+                image
+            )
 
-    st.divider()
+            display_result(
+                medicine_data
+            )
 
-    st.info(
-        "ℹ️ Please verify the detected information "
-        "with the original medicine package."
-    )
+        except json.JSONDecodeError:
+
+            st.error(
+                "The AI returned an unexpected format. "
+                "Please try the image again."
+            )
+
+        except Exception as e:
+
+            st.error(
+                "Unable to analyze the image."
+            )
+
+            st.caption(
+                str(e)
+            )
