@@ -6,6 +6,7 @@ import cv2
 import numpy as np
 from openai import OpenAI
 from PIL import Image
+from io import BytesIO
 
 
 # =========================================================
@@ -22,23 +23,26 @@ st.title("💊 MediScan")
 st.subheader("Scan. Verify. Understand.")
 
 st.write(
-    "Take a photo of a medicine strip and MediScan will "
-    "extract the information printed on the package."
+    "Take a photo of a medicine strip or upload an image. "
+    "MediScan will try to identify the information printed "
+    "on the package."
 )
 
 
 # =========================================================
-# OPENAI
+# OPENAI API
 # =========================================================
 
 try:
     OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
 
 except Exception:
-    st.error(
-        "OPENAI_API_KEY is not configured."
+    st.error("❌ OPENAI_API_KEY is not configured.")
+    st.info(
+        "Add OPENAI_API_KEY in your Streamlit App Settings → Secrets."
     )
     st.stop()
+
 
 client = OpenAI(
     api_key=OPENAI_API_KEY
@@ -51,31 +55,33 @@ client = OpenAI(
 
 def detect_qr(image):
 
-    img = np.array(image)
+    try:
 
-    img = cv2.cvtColor(
-        img,
-        cv2.COLOR_RGB2BGR
-    )
+        img = np.array(image)
 
-    detector = cv2.QRCodeDetector()
+        img = cv2.cvtColor(
+            img,
+            cv2.COLOR_RGB2BGR
+        )
 
-    data, points, _ = detector.detectAndDecode(img)
+        detector = cv2.QRCodeDetector()
 
-    if data:
-        return data.strip()
+        data, points, _ = detector.detectAndDecode(img)
 
-    return None
+        if data:
+            return data.strip()
+
+        return None
+
+    except Exception:
+        return None
 
 
 # =========================================================
-# IMAGE → BASE64
+# IMAGE TO BASE64
 # =========================================================
 
 def image_to_base64(image):
-
-    # Convert image to JPEG
-    from io import BytesIO
 
     buffer = BytesIO()
 
@@ -87,15 +93,13 @@ def image_to_base64(image):
 
     image_bytes = buffer.getvalue()
 
-    encoded = base64.b64encode(
+    return base64.b64encode(
         image_bytes
     ).decode("utf-8")
 
-    return encoded
-
 
 # =========================================================
-# AI MEDICINE READER
+# AI MEDICINE IMAGE ANALYSIS
 # =========================================================
 
 def analyze_medicine_image(image):
@@ -103,74 +107,96 @@ def analyze_medicine_image(image):
     image_base64 = image_to_base64(image)
 
     prompt = """
-You are analyzing a photograph of a medicine package or medicine strip.
+You are analyzing a photograph of a medicine package or
+medicine strip.
 
-Read ONLY information that is actually visible in the image.
-
-Do NOT guess missing information.
+Carefully read the visible text from the image.
 
 Return ONLY valid JSON using exactly these fields:
 
 {
-  "medicine_name": "",
-  "active_ingredient": "",
-  "strength": "",
-  "dosage_form": "",
-  "manufacturer": "",
-  "batch_number": "",
-  "manufacturing_date": "",
-  "expiry_date": "",
-  "mrp": "",
-  "general_use_printed": "",
-  "confidence": ""
+    "medicine_name": "",
+    "active_ingredient": "",
+    "strength": "",
+    "dosage_form": "",
+    "manufacturer": "",
+    "batch_number": "",
+    "manufacturing_date": "",
+    "expiry_date": "",
+    "mrp": "",
+    "general_use_printed": "",
+    "confidence": ""
 }
 
-Rules:
+IMPORTANT RULES:
 
-1. Read the medicine/brand name carefully.
-2. Read the active ingredient if visible.
-3. Read the strength such as 2.5 mg or 500 mg.
-4. Identify the dosage form if visible.
-5. Identify the manufacturer if visible.
-6. Read the batch number only if it is clearly visible.
-7. Read MFG/manufacturing date only if visible.
-8. Read EXP/expiry date only if visible.
-9. Read MRP only if visible.
-10. "general_use_printed" should contain information about use ONLY if such information is actually printed on the package. Do not provide medical advice.
-11. If something cannot be read, return "Not clearly visible".
-12. Do not invent values.
-13. Do not recommend whether a person should take the medicine.
-14. Keep the answer concise.
-15. "confidence" should be one of:
-    "High", "Medium", or "Low".
+1. Read only information that is actually visible.
+2. Do NOT guess or invent information.
+3. If a field cannot be read clearly, write:
+   "Not clearly visible".
+4. Read the medicine/brand name carefully.
+5. Read the active ingredient if visible.
+6. Read the strength, such as 2.5 mg or 500 mg.
+7. Identify the dosage form if visible.
+8. Identify the manufacturer if visible.
+9. Read the batch number only if it is clearly visible.
+10. Read the manufacturing date only if visible.
+11. Read the expiry date only if visible.
+12. Read the MRP only if visible.
+13. general_use_printed must contain only information about
+    use that is actually printed on the package.
+14. Do not provide medical advice.
+15. Do not tell the user whether they personally should take
+    the medicine.
+16. confidence must be exactly one of:
+    "High", "Medium", "Low".
+17. Keep each field concise.
 """
 
-    response = client.responses.create(
-        model="gpt-5.6-luna",
-        input=[
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": prompt
-                    },
-                    {
-                        "type": "input_image",
-                        "image_url": (
-                            "data:image/jpeg;base64,"
-                            + image_base64
-                        ),
-                        "detail": "high"
-                    }
-                ]
-            }
-        ]
-    )
+
+    try:
+
+        response = client.responses.create(
+
+            model="gpt-5.6-luna",
+
+            input=[
+                {
+                    "role": "user",
+
+                    "content": [
+
+                        {
+                            "type": "input_text",
+                            "text": prompt
+                        },
+
+                        {
+                            "type": "input_image",
+                            "image_url":
+                                "data:image/jpeg;base64,"
+                                + image_base64
+                        }
+
+                    ]
+                }
+            ]
+        )
+
+    except Exception as e:
+
+        raise RuntimeError(
+            f"OpenAI API request failed: {e}"
+        )
+
 
     result = response.output_text.strip()
 
-    # Remove ```json if model adds it
+
+    # -----------------------------------------------------
+    # Remove markdown JSON fences if returned
+    # -----------------------------------------------------
+
     result = re.sub(
         r"^```json\s*",
         "",
@@ -179,16 +205,51 @@ Rules:
     )
 
     result = re.sub(
+        r"^```\s*",
+        "",
+        result
+    )
+
+    result = re.sub(
         r"\s*```$",
         "",
         result
     )
 
-    return json.loads(result)
+    result = result.strip()
+
+
+    # -----------------------------------------------------
+    # Convert response to JSON
+    # -----------------------------------------------------
+
+    try:
+
+        return json.loads(result)
+
+    except json.JSONDecodeError:
+
+        # Try to find JSON inside the response
+
+        start = result.find("{")
+        end = result.rfind("}")
+
+        if start != -1 and end != -1:
+
+            json_text = result[
+                start:end + 1
+            ]
+
+            return json.loads(json_text)
+
+        raise RuntimeError(
+            "The AI returned an unexpected response format:\n\n"
+            + result
+        )
 
 
 # =========================================================
-# DISPLAY RESULT
+# DISPLAY MEDICINE INFORMATION
 # =========================================================
 
 def display_result(data):
@@ -199,108 +260,149 @@ def display_result(data):
         "💊 Detected Medicine Information"
     )
 
+
+    # -----------------------------------------------------
+    # Helper
+    # -----------------------------------------------------
+
+    def get_value(key):
+
+        value = data.get(
+            key,
+            "Not clearly visible"
+        )
+
+        if value is None:
+            return "Not clearly visible"
+
+        if str(value).strip() == "":
+            return "Not clearly visible"
+
+        return str(value)
+
+
+    # -----------------------------------------------------
+    # Two columns
+    # -----------------------------------------------------
+
     col1, col2 = st.columns(2)
+
 
     with col1:
 
-        st.write("**Medicine Name**")
+        st.write("**💊 Medicine Name**")
+
         st.info(
-            data.get(
-                "medicine_name",
-                "Not clearly visible"
-            )
+            get_value("medicine_name")
         )
 
-        st.write("**Active Ingredient**")
+
+        st.write("**🧪 Active Ingredient**")
+
         st.info(
-            data.get(
-                "active_ingredient",
-                "Not clearly visible"
-            )
+            get_value("active_ingredient")
         )
 
-        st.write("**Strength**")
+
+        st.write("**💊 Strength**")
+
         st.info(
-            data.get(
-                "strength",
-                "Not clearly visible"
-            )
+            get_value("strength")
         )
 
-        st.write("**Dosage Form**")
+
+        st.write("**💊 Dosage Form**")
+
         st.info(
-            data.get(
-                "dosage_form",
-                "Not clearly visible"
-            )
+            get_value("dosage_form")
         )
 
-        st.write("**Manufacturer**")
+
+        st.write("**🏭 Manufacturer**")
+
         st.info(
-            data.get(
-                "manufacturer",
-                "Not clearly visible"
-            )
+            get_value("manufacturer")
         )
+
 
     with col2:
 
-        st.write("**Batch Number**")
+        st.write("**📦 Batch Number**")
+
         st.info(
-            data.get(
-                "batch_number",
-                "Not clearly visible"
-            )
+            get_value("batch_number")
         )
 
-        st.write("**Manufacturing Date**")
+
+        st.write("**📅 Manufacturing Date**")
+
         st.info(
-            data.get(
-                "manufacturing_date",
-                "Not clearly visible"
-            )
+            get_value("manufacturing_date")
         )
 
-        st.write("**Expiry Date**")
+
+        st.write("**📅 Expiry Date**")
+
         st.info(
-            data.get(
-                "expiry_date",
-                "Not clearly visible"
-            )
+            get_value("expiry_date")
         )
 
-        st.write("**MRP**")
+
+        st.write("**💰 MRP**")
+
         st.info(
-            data.get(
-                "mrp",
-                "Not clearly visible"
-            )
+            get_value("mrp")
         )
 
-    st.subheader("📌 Information Printed on Package")
+
+    # -----------------------------------------------------
+    # Printed information
+    # -----------------------------------------------------
+
+    st.subheader(
+        "📌 Information Printed on Package"
+    )
 
     st.write(
-        data.get(
-            "general_use_printed",
-            "Not clearly visible"
+        get_value("general_use_printed")
+    )
+
+
+    # -----------------------------------------------------
+    # Confidence
+    # -----------------------------------------------------
+
+    st.subheader(
+        "🔍 Reading Confidence"
+    )
+
+    confidence = get_value(
+        "confidence"
+    )
+
+
+    if confidence.lower() == "high":
+
+        st.success(
+            "🟢 High confidence"
         )
-    )
 
-    st.subheader("🔍 Reading Confidence")
+    elif confidence.lower() == "medium":
 
-    confidence = data.get(
-        "confidence",
-        "Low"
-    )
-
-    if confidence == "High":
-        st.success("High confidence")
-
-    elif confidence == "Medium":
-        st.warning("Medium confidence")
+        st.warning(
+            "🟡 Medium confidence"
+        )
 
     else:
-        st.warning("Low confidence")
+
+        st.warning(
+            "🔴 Low confidence"
+        )
+
+
+    # -----------------------------------------------------
+    # Verification message
+    # -----------------------------------------------------
 
     st.divider()
 
@@ -316,15 +418,17 @@ def display_result(data):
 
 st.divider()
 
-st.subheader("📷 Scan Medicine Strip")
+st.subheader(
+    "📷 Scan Medicine Strip"
+)
 
 camera_photo = st.camera_input(
     "Take a clear picture of the medicine strip"
 )
 
 st.caption(
-    "For best results, keep the printed side facing the camera "
-    "and use good lighting."
+    "For best results, keep the printed side facing "
+    "the camera and use good lighting."
 )
 
 
@@ -332,10 +436,12 @@ st.caption(
 # IMAGE UPLOAD
 # =========================================================
 
-st.subheader("🖼️ Or Upload a Medicine Image")
+st.subheader(
+    "🖼️ Or Upload a Medicine Image"
+)
 
 uploaded_photo = st.file_uploader(
-    "Choose an image",
+    "Choose a medicine image",
     type=[
         "jpg",
         "jpeg",
@@ -344,7 +450,10 @@ uploaded_photo = st.file_uploader(
 )
 
 
-# Use camera photo first
+# =========================================================
+# SELECT IMAGE
+# =========================================================
+
 photo = camera_photo or uploaded_photo
 
 
@@ -354,7 +463,24 @@ photo = camera_photo or uploaded_photo
 
 if photo:
 
-    image = Image.open(photo)
+    try:
+
+        image = Image.open(photo)
+
+        image = image.convert("RGB")
+
+    except Exception:
+
+        st.error(
+            "❌ Unable to open this image."
+        )
+
+        st.stop()
+
+
+    # -----------------------------------------------------
+    # Show image
+    # -----------------------------------------------------
 
     st.image(
         image,
@@ -362,7 +488,11 @@ if photo:
         use_container_width=True
     )
 
-    # QR check
+
+    # -----------------------------------------------------
+    # QR Detection
+    # -----------------------------------------------------
+
     qr_data = detect_qr(image)
 
     if qr_data:
@@ -371,7 +501,11 @@ if photo:
             f"📱 QR Code detected: {qr_data}"
         )
 
-    # AI analysis
+
+    # -----------------------------------------------------
+    # AI Analysis
+    # -----------------------------------------------------
+
     with st.spinner(
         "🤖 AI is reading the medicine package..."
     ):
@@ -386,19 +520,30 @@ if photo:
                 medicine_data
             )
 
-        except json.JSONDecodeError:
+
+        except json.JSONDecodeError as e:
 
             st.error(
-                "The AI returned an unexpected format. "
-                "Please try the image again."
+                "❌ The AI returned invalid JSON."
             )
+
+            st.code(
+                str(e),
+                language="text"
+            )
+
 
         except Exception as e:
 
             st.error(
-                "Unable to analyze the image."
+                "❌ Unable to analyze the image."
             )
 
-            st.caption(
-                str(e)
+            st.write(
+                "Here is the actual error:"
+            )
+
+            st.code(
+                str(e),
+                language="text"
             )
