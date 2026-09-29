@@ -4,7 +4,6 @@ import json
 import re
 import cv2
 import numpy as np
-from openai import OpenAI
 from PIL import Image
 from io import BytesIO
 
@@ -27,27 +26,6 @@ st.write(
     "MediScan will try to identify the information printed "
     "on the package."
 )
-
-
-# =========================================================
-# OPENAI API
-# =========================================================
-
-try:
-    OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
-
-except Exception:
-    st.error("❌ OPENAI_API_KEY is not configured.")
-    st.info(
-        "Add OPENAI_API_KEY in your Streamlit App Settings → Secrets."
-    )
-    st.stop()
-
-
-client = OpenAI(
-    api_key=OPENAI_API_KEY
-)
-
 
 # =========================================================
 # QR CODE DETECTION
