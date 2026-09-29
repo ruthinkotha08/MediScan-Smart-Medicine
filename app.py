@@ -53,7 +53,6 @@ st.write(
 def detect_qr(image):
 
     try:
-
         img = np.array(image)
 
         img = cv2.cvtColor(
@@ -137,7 +136,7 @@ IMPORTANT RULES:
 2. Do NOT guess or invent information.
 3. If a field cannot be read clearly, write:
    "Not clearly visible".
-4. Read the medicine/brand name carefully.
+4. Read the medicine or brand name carefully.
 5. Read the active ingredient if visible.
 6. Read the strength, such as 2.5 mg or 500 mg.
 7. Identify the dosage form if visible.
@@ -146,41 +145,34 @@ IMPORTANT RULES:
 10. Read the manufacturing date only if visible.
 11. Read the expiry date only if visible.
 12. Read the MRP only if visible.
-13. general_use_printed must contain only information about
-    use that is actually printed on the package.
+13. general_use_printed must contain only information
+    about use that is actually printed on the package.
 14. Do not provide medical advice.
-15. Do not tell the user whether they personally should take
-    the medicine.
+15. Do not tell the user whether they personally should
+    take the medicine.
 16. confidence must be exactly one of:
     "High", "Medium", "Low".
 17. Keep each field concise.
 """
 
-
     try:
 
         response = client.responses.create(
-
             model="gpt-5.6-luna",
-
             input=[
                 {
                     "role": "user",
-
                     "content": [
-
                         {
                             "type": "input_text",
                             "text": prompt
                         },
-
                         {
                             "type": "input_image",
                             "image_url":
                                 "data:image/jpeg;base64,"
                                 + image_base64
                         }
-
                     ]
                 }
             ]
@@ -192,14 +184,9 @@ IMPORTANT RULES:
             f"OpenAI API request failed: {e}"
         )
 
-
     result = response.output_text.strip()
 
-
-    # -----------------------------------------------------
-    # Remove Markdown JSON fences
-    # -----------------------------------------------------
-
+    # Remove markdown JSON fences
     result = re.sub(
         r"^```json\s*",
         "",
@@ -221,11 +208,7 @@ IMPORTANT RULES:
 
     result = result.strip()
 
-
-    # -----------------------------------------------------
     # Convert response to JSON
-    # -----------------------------------------------------
-
     try:
 
         return json.loads(result)
@@ -261,7 +244,6 @@ def display_result(data):
         "💊 Detected Medicine Information"
     )
 
-
     def get_value(key):
 
         value = data.get(
@@ -277,9 +259,7 @@ def display_result(data):
 
         return str(value)
 
-
     col1, col2 = st.columns(2)
-
 
     with col1:
 
@@ -289,13 +269,11 @@ def display_result(data):
             get_value("medicine_name")
         )
 
-
         st.write("**🧪 Active Ingredient**")
 
         st.info(
             get_value("active_ingredient")
         )
-
 
         st.write("**💊 Strength**")
 
@@ -303,20 +281,17 @@ def display_result(data):
             get_value("strength")
         )
 
-
         st.write("**💊 Dosage Form**")
 
         st.info(
             get_value("dosage_form")
         )
 
-
         st.write("**🏭 Manufacturer**")
 
         st.info(
             get_value("manufacturer")
         )
-
 
     with col2:
 
@@ -326,13 +301,11 @@ def display_result(data):
             get_value("batch_number")
         )
 
-
         st.write("**📅 Manufacturing Date**")
 
         st.info(
             get_value("manufacturing_date")
         )
-
 
         st.write("**📅 Expiry Date**")
 
@@ -340,17 +313,11 @@ def display_result(data):
             get_value("expiry_date")
         )
 
-
         st.write("**💰 MRP**")
 
         st.info(
             get_value("mrp")
         )
-
-
-    # -----------------------------------------------------
-    # Information printed on package
-    # -----------------------------------------------------
 
     st.subheader(
         "📌 Information Printed on Package"
@@ -360,11 +327,6 @@ def display_result(data):
         get_value("general_use_printed")
     )
 
-
-    # -----------------------------------------------------
-    # Confidence
-    # -----------------------------------------------------
-
     st.subheader(
         "🔍 Reading Confidence"
     )
@@ -372,7 +334,6 @@ def display_result(data):
     confidence = get_value(
         "confidence"
     )
-
 
     if confidence.lower() == "high":
 
@@ -392,19 +353,108 @@ def display_result(data):
             "🔴 Low confidence"
         )
 
-
-    # -----------------------------------------------------
-    # Verification message
-    # -----------------------------------------------------
-
     st.divider()
 
-    st.info(     )
+    st.info(
+        "ℹ️ Please verify the detected information "
+        "with the original medicine package."
+    )
+
+
+# =========================================================
+# CAMERA
+# =========================================================
+
+st.divider()
+
+st.subheader(
+    "📷 Scan Medicine Strip"
+)
+
+camera_photo = st.camera_input(
+    "Take a clear picture of the medicine strip"
+)
+
+st.caption(
+    "For best results, keep the printed side facing "
+    "the camera and use good lighting."
+)
+
+
+# =========================================================
+# IMAGE UPLOAD
+# =========================================================
+
+st.subheader(
+    "🖼️ Or Upload a Medicine Image"
+)
+
+uploaded_photo = st.file_uploader(
+    "Choose a medicine image",
+    type=[
+        "jpg",
+        "jpeg",
+        "png"
+    ]
+)
+
+
+# =========================================================
+# SELECT IMAGE
+# =========================================================
+
+photo = camera_photo or uploaded_photo
+
+
+# =========================================================
+# PROCESS IMAGE
+# =========================================================
+
+if photo:
+
+    try:
+
+        image = Image.open(photo)
+
+        image = image.convert("RGB")
+
+    except Exception:
+
+        st.error(
+            "❌ Unable to open this image."
+        )
+
+        st.stop()
+
+    st.image(
+        image,
+        caption="Medicine image",
+        use_container_width=True
+    )
+
+    # QR Detection
+    qr_data = detect_qr(image)
+
+    if qr_data:
+
+        st.success(
+            f"📱 QR Code detected: {qr_data}"
+        )
+
+    # AI Analysis
+    with st.spinner(
+        "🤖 AI is reading the medicine package..."
+    ):
+
+        try:
+
+            medicine_data = analyze_medicine_image(
+                image
+            )
 
             display_result(
                 medicine_data
             )
-
 
         except json.JSONDecodeError as e:
 
@@ -416,7 +466,6 @@ def display_result(data):
                 str(e),
                 language="text"
             )
-
 
         except Exception as e:
 
