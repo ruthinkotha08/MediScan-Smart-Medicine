@@ -1,160 +1,96 @@
+import base64
+import json
+import os
+import re
+from datetime import date, datetime
+from typing import Any, Dict, List, Optional
 
-# -----------------------------------------------------------------------------
-# Session state
-# -----------------------------------------------------------------------------
-if "cabinet" not in st.session_state:
-    st.session_state.cabinet = []
-if "scan_history" not in st.session_state:
-    st.session_state.scan_history = []
-if "last_result" not in st.session_state:
-    st.session_state.last_result = None
-if "last_memory_context" not in st.session_state:
-    st.session_state.last_memory_context = []
-if "memory_profile" not in st.session_state:
-    st.session_state.memory_profile = "demo-user-001"
+import cv2
+import numpy as np
+import streamlit as st
 
-# -----------------------------------------------------------------------------
-# Config helpers
-# -----------------------------------------------------------------------------
-def secret(name: str, default: str = "") -> str:
-    try:
-        value = st.secrets.get(name, None)
-        if value is not None:
-            return str(value).strip()
-    except Exception:
-        pass
-    return str(os.getenv(name, default) or default).strip()
+# Optional dependencies are imported defensively so the app can still start
+# when one integration is not configured.
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None
+
+try:
+    from hindsight_client import Hindsight
+except Exception:
+    Hindsight = None
 
 
-OPENAI_API_KEY = secret("OPENAI_API_KEY")
-OPENAI_MODEL = secret("OPENAI_MODEL", "gpt-5")
-HINDSIGHT_API_KEY = secret("HINDSIGHT_API_KEY")
-HINDSIGHT_BASE_URL = secret(
-    "HINDSIGHT_BASE_URL",
-    "https://api.hindsight.vectorize.io",
-)
-HINDSIGHT_BANK_ID = secret(
-    "HINDSIGHT_BANK_ID",
-    "mediscan-memory-agent",
+st.set_page_config(
+    page_title="MediScan — Medicine Memory Agent",
+    page_icon="💊",
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-
-@st.cache_resource(show_spinner=False)
-def get_openai_client():
-    if not OPENAI_API_KEY or OpenAI is None:
-        return None
-    try:
-        return OpenAI(api_key=OPENAI_API_KEY)
-    except Exception:
-        return None
-
-
-@st.cache_resource(show_spinner=False)
-def get_hindsight_client():
-    if not HINDSIGHT_API_KEY:
-        st.session_state["hindsight_error"] = (
-            "HINDSIGHT_API_KEY is missing. Add it to Streamlit Secrets."
-        )
-        return None
-
-    if Hindsight is None:
-        st.session_state["hindsight_error"] = (
-            "The hindsight-client package is not installed. "
-            "Add hindsight-client to requirements.txt and redeploy."
-        )
-        return None
-
-    try:
-        client = Hindsight(
-            base_url=HINDSIGHT_BASE_URL,
-            api_key=HINDSIGHT_API_KEY,
-        )
-        st.session_state["hindsight_error"] = ""
-        return client
-    except Exception as e:
-        st.session_state["hindsight_error"] = (
-            f"{type(e).__name__}: {e}"
-        )
-        return None
-
-
-def ensure_hindsight_bank(client) -> bool:
-    if client is None:
-        return False
-    try:
-        client.create_bank(
-            bank_id=HINDSIGHT_BANK_ID,
-            name="MediScan Medicine Memory Agent",
-            background=(
-                "A medicine information assistant that remembers prior scan context, "
-                "user explanation preferences, and previous medicine-information interactions. "
-                "It must not diagnose, prescribe, or invent medicine facts."
-            ),
-            disposition={"skepticism": 4, "literalism": 5, "empathy": 4},
-        )
-    except Exception:
-        # A 409/already-existing bank is expected on subsequent app starts.
-        pass
-    return True
-
-
-hindsight = get_hindsight_client()
-hindsight_ready = ensure_hindsight_bank(hindsight)
-openai_client = get_openai_client()
+# -----------------------------------------------------------------------------
+# Demo medicine data
+# -----------------------------------------------------------------------------
+MEDICINES: Dict[str, Dict[str, str]] = {
+    "MED001": {
+        "name": "DemoCure 500",
+        "ingredient": "Sample active ingredient",
+        "manufacturer": "MediScan Demo Pharma",
+        "mfg": "2025-01-15",
+        "expiry": "2027-01-14",
+        "batch": "MS-A1025",
+        "form": "Tablet",
+        "use": "Demo record showing how a labeled general use can be explained in simple language.",
+        "warning": "Follow the product label and prescription. This demo record is not medical advice.",
+    },
+    "MED002": {
+        "name": "DemoRelief 10",
+        "ingredient": "Sample active ingredient",
+        "manufacturer": "MediScan Demo Pharma",
+        "mfg": "2026-02-01",
+        "expiry": "2028-01-31",
+        "batch": "MS-B2206",
+        "form": "Tablet",
+        "use": "Demo record showing a plain-language explanation of a medicine's general purpose.",
+        "warning": "Check the official label for contraindications, interactions, dosage, and other warnings.",
+    },
+    "MED003": {
+        "name": "ExpiredDemo 250",
+        "ingredient": "Sample active ingredient",
+        "manufacturer": "MediScan Demo Pharma",
+        "mfg": "2023-03-01",
+        "expiry": "2025-02-28",
+        "batch": "MS-X2303",
+        "form": "Capsule",
+        "use": "Demo record used to demonstrate expiry detection.",
+        "warning": "This demo product is expired. A real system should clearly flag it and direct the user to appropriate professional guidance.",
+    },
+}
 
 # -----------------------------------------------------------------------------
-# Hindsight memory layer
+# Styling
 # -----------------------------------------------------------------------------
-def retain_memory(content: str, context: str = "MediScan interaction") -> bool:
-    if not hindsight_ready or hindsight is None:
-        return False
-    try:
-        hindsight.retain(
-            bank_id=HINDSIGHT_BANK_ID,
-            content=f"Profile: {st.session_state.memory_profile}. {content}",
-            context=context,
-            metadata={
-                "app": "mediscan",
-                "profile": st.session_state.memory_profile,
-            },
-        )
-        return True
-    except Exception as e:
-        st.session_state["hindsight_error"] = (
-            f"Retain failed: {type(e).__name__}: {e}"
-        )
-        return False
-
-
-def recall_memories(query: str, limit: int = 6) -> List[str]:
-    if not hindsight_ready or hindsight is None:
-        return []
-    try:
-        result = hindsight.recall(
-            bank_id=HINDSIGHT_BANK_ID,
-            query=f"Profile: {st.session_state.memory_profile}. {query}",
-            max_tokens=2500,
-            budget="low",
-        )
-        memories = []
-        for item in result.results[:limit]:
-            text = getattr(item, "text", None)
-            if text:
-                memories.append(text)
-        return memories
-    except Exception as e:
-        st.session_state["hindsight_error"] = (
-            f"Recall failed: {type(e).__name__}: {e}"
-        )
-        return []
-
-
-# -----------------------------------------------------------------------------
-# QR / image helpers
-# -----------------------------------------------------------------------------
-def decode_qr(image_bytes: bytes) -> Optional[str]:
-    try:
-        arr = np.frombuffer(image_bytes, np.uint8)
-        image = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if image is None:
-            return None
+st.markdown(
+    """
+    <style>
+    :root { --blue:#155EEF; --navy:#102A43; --green:#12B76A; --red:#D92D20; --muted:#667085; }
+    .block-container { max-width: 1250px; padding-top: 2rem; }
+    .hero { padding: 1.8rem 2rem; border-radius: 24px; background: linear-gradient(135deg,#eef6ff,#f7fbff 55%,#ecfdf3); border:1px solid #d9e7f7; }
+    .eyebrow { color:var(--blue); font-weight:800; letter-spacing:2px; font-size:.78rem; margin-bottom:.25rem; }
+    .hero h1 { font-size:3rem; margin:.1rem 0 .5rem; color:var(--navy); }
+    .hero p { color:#475467; font-size:1.05rem; line-height:1.65; }
+    .pill { display:inline-block; padding:.35rem .7rem; border-radius:999px; background:#e8f1ff; color:#155EEF; font-weight:700; font-size:.8rem; margin:.15rem; }
+    .memory-card { padding:1rem 1.1rem; border:1px solid #dbe5f0; border-radius:16px; background:#fff; margin-bottom:.6rem; }
+    .memory-on { border-left:5px solid #12B76A; background:#f6fffa; }
+    .memory-off { border-left:5px solid #98A2B3; background:#f8fafc; }
+    .metric-card { padding:1rem; border:1px solid #e4e7ec; border-radius:16px; background:#fff; }
+    .small { color:#667085; font-size:.86rem; }
+    .warning { padding:1rem; border-radius:14px; background:#fffaeb; border:1px solid #fedf89; }
+    .danger { padding:1rem; border-radius:14px; background:#fef3f2; border:1px solid #fecdca; }
+    .success { padding:1rem; border-radius:14px; background:#ecfdf3; border:1px solid #abefc6; }
+    .flow { font-weight:800; color:#344054; text-align:center; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
