@@ -1,6 +1,5 @@
-streamlit>=1.40,<2.0
-opencv-python-headless>=4.10,<5
-numpy>=1.26,<3
-Pillow>=10,<12
-openai>=1.100,<3
-hindsight-client>=0.5,<1
+streamlit
+opencv-python-headless
+numpy
+openai
+hindsight-client
