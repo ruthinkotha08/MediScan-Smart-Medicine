@@ -6,6 +6,7 @@ import cv2
 import numpy as np
 from PIL import Image
 from io import BytesIO
+from openai import OpenAI
 
 
 # =========================================================
@@ -18,6 +19,23 @@ st.set_page_config(
     layout="centered"
 )
 
+
+# =========================================================
+# OPENAI CLIENT
+# =========================================================
+
+try:
+    client = OpenAI(
+        api_key=st.secrets["OPENAI_API_KEY"]
+    )
+except Exception:
+    client = None
+
+
+# =========================================================
+# TITLE
+# =========================================================
+
 st.title("💊 MediScan")
 st.subheader("Scan. Verify. Understand.")
 
@@ -26,6 +44,7 @@ st.write(
     "MediScan will try to identify the information printed "
     "on the package."
 )
+
 
 # =========================================================
 # QR CODE DETECTION
@@ -81,6 +100,12 @@ def image_to_base64(image):
 # =========================================================
 
 def analyze_medicine_image(image):
+
+    if client is None:
+        raise RuntimeError(
+            "OpenAI client is not configured. "
+            "Please add OPENAI_API_KEY to Streamlit Secrets."
+        )
 
     image_base64 = image_to_base64(image)
 
@@ -172,7 +197,7 @@ IMPORTANT RULES:
 
 
     # -----------------------------------------------------
-    # Remove markdown JSON fences if returned
+    # Remove Markdown JSON fences
     # -----------------------------------------------------
 
     result = re.sub(
@@ -207,8 +232,6 @@ IMPORTANT RULES:
 
     except json.JSONDecodeError:
 
-        # Try to find JSON inside the response
-
         start = result.find("{")
         end = result.rfind("}")
 
@@ -239,10 +262,6 @@ def display_result(data):
     )
 
 
-    # -----------------------------------------------------
-    # Helper
-    # -----------------------------------------------------
-
     def get_value(key):
 
         value = data.get(
@@ -258,10 +277,6 @@ def display_result(data):
 
         return str(value)
 
-
-    # -----------------------------------------------------
-    # Two columns
-    # -----------------------------------------------------
 
     col1, col2 = st.columns(2)
 
@@ -334,7 +349,7 @@ def display_result(data):
 
 
     # -----------------------------------------------------
-    # Printed information
+    # Information printed on package
     # -----------------------------------------------------
 
     st.subheader(
@@ -384,115 +399,7 @@ def display_result(data):
 
     st.divider()
 
-    st.info(
-        "ℹ️ Please verify the detected information "
-        "with the original medicine package."
-    )
-
-
-# =========================================================
-# CAMERA
-# =========================================================
-
-st.divider()
-
-st.subheader(
-    "📷 Scan Medicine Strip"
-)
-
-camera_photo = st.camera_input(
-    "Take a clear picture of the medicine strip"
-)
-
-st.caption(
-    "For best results, keep the printed side facing "
-    "the camera and use good lighting."
-)
-
-
-# =========================================================
-# IMAGE UPLOAD
-# =========================================================
-
-st.subheader(
-    "🖼️ Or Upload a Medicine Image"
-)
-
-uploaded_photo = st.file_uploader(
-    "Choose a medicine image",
-    type=[
-        "jpg",
-        "jpeg",
-        "png"
-    ]
-)
-
-
-# =========================================================
-# SELECT IMAGE
-# =========================================================
-
-photo = camera_photo or uploaded_photo
-
-
-# =========================================================
-# PROCESS IMAGE
-# =========================================================
-
-if photo:
-
-    try:
-
-        image = Image.open(photo)
-
-        image = image.convert("RGB")
-
-    except Exception:
-
-        st.error(
-            "❌ Unable to open this image."
-        )
-
-        st.stop()
-
-
-    # -----------------------------------------------------
-    # Show image
-    # -----------------------------------------------------
-
-    st.image(
-        image,
-        caption="Medicine image",
-        use_container_width=True
-    )
-
-
-    # -----------------------------------------------------
-    # QR Detection
-    # -----------------------------------------------------
-
-    qr_data = detect_qr(image)
-
-    if qr_data:
-
-        st.success(
-            f"📱 QR Code detected: {qr_data}"
-        )
-
-
-    # -----------------------------------------------------
-    # AI Analysis
-    # -----------------------------------------------------
-
-    with st.spinner(
-        "🤖 AI is reading the medicine package..."
-    ):
-
-        try:
-
-            medicine_data = analyze_medicine_image(
-                image
-            )
+    st.info(     )
 
             display_result(
                 medicine_data
