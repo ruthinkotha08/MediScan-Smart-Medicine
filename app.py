@@ -1,483 +1,635 @@
-import streamlit as st
 import base64
 import json
+import os
 import re
+from datetime import date, datetime
+from typing import Any, Dict, List, Optional
+
 import cv2
 import numpy as np
-from PIL import Image
-from io import BytesIO
-from openai import OpenAI
+import streamlit as st
 
-
-# =========================================================
-# PAGE CONFIGURATION
-# =========================================================
-
-st.set_page_config(
-    page_title="MediScan",
-    page_icon="💊",
-    layout="centered"
-)
-
-
-# =========================================================
-# OPENAI CLIENT
-# =========================================================
+# Optional dependencies are imported defensively so the app can still start
+# when one integration is not configured.
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None
 
 try:
-    client = OpenAI(
-        api_key=st.secrets["OPENAI_API_KEY"]
-    )
+    from hindsight_client import Hindsight
 except Exception:
-    client = None
+    Hindsight = None
 
 
-# =========================================================
-# TITLE
-# =========================================================
-
-st.title("💊 MediScan")
-st.subheader("Scan. Verify. Understand.")
-
-st.write(
-    "Take a photo of a medicine strip or upload an image. "
-    "MediScan will try to identify the information printed "
-    "on the package."
+st.set_page_config(
+    page_title="MediScan — Medicine Memory Agent",
+    page_icon="💊",
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
+# -----------------------------------------------------------------------------
+# Demo medicine data
+# -----------------------------------------------------------------------------
+MEDICINES: Dict[str, Dict[str, str]] = {
+    "MED001": {
+        "name": "DemoCure 500",
+        "ingredient": "Sample active ingredient",
+        "manufacturer": "MediScan Demo Pharma",
+        "mfg": "2025-01-15",
+        "expiry": "2027-01-14",
+        "batch": "MS-A1025",
+        "form": "Tablet",
+        "use": "Demo record showing how a labeled general use can be explained in simple language.",
+        "warning": "Follow the product label and prescription. This demo record is not medical advice.",
+    },
+    "MED002": {
+        "name": "DemoRelief 10",
+        "ingredient": "Sample active ingredient",
+        "manufacturer": "MediScan Demo Pharma",
+        "mfg": "2026-02-01",
+        "expiry": "2028-01-31",
+        "batch": "MS-B2206",
+        "form": "Tablet",
+        "use": "Demo record showing a plain-language explanation of a medicine's general purpose.",
+        "warning": "Check the official label for contraindications, interactions, dosage, and other warnings.",
+    },
+    "MED003": {
+        "name": "ExpiredDemo 250",
+        "ingredient": "Sample active ingredient",
+        "manufacturer": "MediScan Demo Pharma",
+        "mfg": "2023-03-01",
+        "expiry": "2025-02-28",
+        "batch": "MS-X2303",
+        "form": "Capsule",
+        "use": "Demo record used to demonstrate expiry detection.",
+        "warning": "This demo product is expired. A real system should clearly flag it and direct the user to appropriate professional guidance.",
+    },
+}
 
-# =========================================================
-# QR CODE DETECTION
-# =========================================================
+# -----------------------------------------------------------------------------
+# Styling
+# -----------------------------------------------------------------------------
+st.markdown(
+    """
+    <style>
+    :root { --blue:#155EEF; --navy:#102A43; --green:#12B76A; --red:#D92D20; --muted:#667085; }
+    .block-container { max-width: 1250px; padding-top: 2rem; }
+    .hero { padding: 1.8rem 2rem; border-radius: 24px; background: linear-gradient(135deg,#eef6ff,#f7fbff 55%,#ecfdf3); border:1px solid #d9e7f7; }
+    .eyebrow { color:var(--blue); font-weight:800; letter-spacing:2px; font-size:.78rem; margin-bottom:.25rem; }
+    .hero h1 { font-size:3rem; margin:.1rem 0 .5rem; color:var(--navy); }
+    .hero p { color:#475467; font-size:1.05rem; line-height:1.65; }
+    .pill { display:inline-block; padding:.35rem .7rem; border-radius:999px; background:#e8f1ff; color:#155EEF; font-weight:700; font-size:.8rem; margin:.15rem; }
+    .memory-card { padding:1rem 1.1rem; border:1px solid #dbe5f0; border-radius:16px; background:#fff; margin-bottom:.6rem; }
+    .memory-on { border-left:5px solid #12B76A; background:#f6fffa; }
+    .memory-off { border-left:5px solid #98A2B3; background:#f8fafc; }
+    .metric-card { padding:1rem; border:1px solid #e4e7ec; border-radius:16px; background:#fff; }
+    .small { color:#667085; font-size:.86rem; }
+    .warning { padding:1rem; border-radius:14px; background:#fffaeb; border:1px solid #fedf89; }
+    .danger { padding:1rem; border-radius:14px; background:#fef3f2; border:1px solid #fecdca; }
+    .success { padding:1rem; border-radius:14px; background:#ecfdf3; border:1px solid #abefc6; }
+    .flow { font-weight:800; color:#344054; text-align:center; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-def detect_qr(image):
+# -----------------------------------------------------------------------------
+# Session state
+# -----------------------------------------------------------------------------
+if "cabinet" not in st.session_state:
+    st.session_state.cabinet = []
+if "scan_history" not in st.session_state:
+    st.session_state.scan_history = []
+if "last_result" not in st.session_state:
+    st.session_state.last_result = None
+if "last_memory_context" not in st.session_state:
+    st.session_state.last_memory_context = []
+if "memory_profile" not in st.session_state:
+    st.session_state.memory_profile = "demo-user-001"
 
+# -----------------------------------------------------------------------------
+# Config helpers
+# -----------------------------------------------------------------------------
+def secret(name: str, default: str = "") -> str:
     try:
-        img = np.array(image)
+        value = st.secrets.get(name, default)
+        return str(value) if value is not None else default
+    except Exception:
+        return os.getenv(name, default)
 
-        img = cv2.cvtColor(
-            img,
-            cv2.COLOR_RGB2BGR
-        )
 
-        detector = cv2.QRCodeDetector()
+OPENAI_API_KEY = secret("OPENAI_API_KEY")
+OPENAI_MODEL = secret("OPENAI_MODEL", "gpt-5")
+HINDSIGHT_API_KEY = secret("HINDSIGHT_API_KEY")
+HINDSIGHT_BASE_URL = secret("HINDSIGHT_BASE_URL", "https://api.hindsight.vectorize.io")
+HINDSIGHT_BANK_ID = secret("HINDSIGHT_BANK_ID", "mediscan-memory-agent")
 
-        data, points, _ = detector.detectAndDecode(img)
 
-        if data:
-            return data.strip()
-
+@st.cache_resource(show_spinner=False)
+def get_openai_client():
+    if not OPENAI_API_KEY or OpenAI is None:
         return None
-
+    try:
+        return OpenAI(api_key=OPENAI_API_KEY)
     except Exception:
         return None
 
 
-# =========================================================
-# IMAGE TO BASE64
-# =========================================================
-
-def image_to_base64(image):
-
-    buffer = BytesIO()
-
-    image.convert("RGB").save(
-        buffer,
-        format="JPEG",
-        quality=95
-    )
-
-    image_bytes = buffer.getvalue()
-
-    return base64.b64encode(
-        image_bytes
-    ).decode("utf-8")
-
-
-# =========================================================
-# AI MEDICINE IMAGE ANALYSIS
-# =========================================================
-
-def analyze_medicine_image(image):
-
-    if client is None:
-        raise RuntimeError(
-            "OpenAI client is not configured. "
-            "Please add OPENAI_API_KEY to Streamlit Secrets."
-        )
-
-    image_base64 = image_to_base64(image)
-
-    prompt = """
-You are analyzing a photograph of a medicine package or
-medicine strip.
-
-Carefully read the visible text from the image.
-
-Return ONLY valid JSON using exactly these fields:
-
-{
-    "medicine_name": "",
-    "active_ingredient": "",
-    "strength": "",
-    "dosage_form": "",
-    "manufacturer": "",
-    "batch_number": "",
-    "manufacturing_date": "",
-    "expiry_date": "",
-    "mrp": "",
-    "general_use_printed": "",
-    "confidence": ""
-}
-
-IMPORTANT RULES:
-
-1. Read only information that is actually visible.
-2. Do NOT guess or invent information.
-3. If a field cannot be read clearly, write:
-   "Not clearly visible".
-4. Read the medicine or brand name carefully.
-5. Read the active ingredient if visible.
-6. Read the strength, such as 2.5 mg or 500 mg.
-7. Identify the dosage form if visible.
-8. Identify the manufacturer if visible.
-9. Read the batch number only if it is clearly visible.
-10. Read the manufacturing date only if visible.
-11. Read the expiry date only if visible.
-12. Read the MRP only if visible.
-13. general_use_printed must contain only information
-    about use that is actually printed on the package.
-14. Do not provide medical advice.
-15. Do not tell the user whether they personally should
-    take the medicine.
-16. confidence must be exactly one of:
-    "High", "Medium", "Low".
-17. Keep each field concise.
-"""
-
+@st.cache_resource(show_spinner=False)
+def get_hindsight_client():
+    if not HINDSIGHT_API_KEY or Hindsight is None:
+        return None
     try:
+        return Hindsight(base_url=HINDSIGHT_BASE_URL, api_key=HINDSIGHT_API_KEY)
+    except Exception:
+        return None
 
-        response = client.responses.create(
-            model="gpt-5.6-luna",
+
+def ensure_hindsight_bank(client) -> bool:
+    if client is None:
+        return False
+    try:
+        client.create_bank(
+            bank_id=HINDSIGHT_BANK_ID,
+            name="MediScan Medicine Memory Agent",
+            background=(
+                "A medicine information assistant that remembers prior scan context, "
+                "user explanation preferences, and previous medicine-information interactions. "
+                "It must not diagnose, prescribe, or invent medicine facts."
+            ),
+            disposition={"skepticism": 4, "literalism": 5, "empathy": 4},
+        )
+    except Exception:
+        # A 409/already-existing bank is expected on subsequent app starts.
+        pass
+    return True
+
+
+hindsight = get_hindsight_client()
+hindsight_ready = ensure_hindsight_bank(hindsight)
+openai_client = get_openai_client()
+
+# -----------------------------------------------------------------------------
+# Hindsight memory layer
+# -----------------------------------------------------------------------------
+def retain_memory(content: str, context: str = "MediScan interaction") -> bool:
+    if not hindsight_ready or hindsight is None:
+        return False
+    try:
+        hindsight.retain(
+            bank_id=HINDSIGHT_BANK_ID,
+            content=f"Profile: {st.session_state.memory_profile}. {content}",
+            context=context,
+            metadata={"app": "mediscan", "profile": st.session_state.memory_profile},
+            tags=["mediscan", "medicine", "memory-agent"],
+        )
+        return True
+    except Exception:
+        return False
+
+
+def recall_memories(query: str, limit: int = 6) -> List[str]:
+    if not hindsight_ready or hindsight is None:
+        return []
+    try:
+        result = hindsight.recall(
+            bank_id=HINDSIGHT_BANK_ID,
+            query=f"Profile: {st.session_state.memory_profile}. {query}",
+            max_tokens=2500,
+            budget="low",
+        )
+        memories = []
+        for item in result.results[:limit]:
+            text = getattr(item, "text", None)
+            if text:
+                memories.append(text)
+        return memories
+    except Exception:
+        return []
+
+
+# -----------------------------------------------------------------------------
+# QR / image helpers
+# -----------------------------------------------------------------------------
+def decode_qr(image_bytes: bytes) -> Optional[str]:
+    try:
+        arr = np.frombuffer(image_bytes, np.uint8)
+        image = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if image is None:
+            return None
+        detector = cv2.QRCodeDetector()
+        data, _, _ = detector.detectAndDecode(image)
+        return data.strip() if data else None
+    except Exception:
+        return None
+
+
+def normalize_medicine_id(raw: str) -> str:
+    raw = (raw or "").strip().upper()
+    match = re.search(r"MED\d{3}", raw)
+    return match.group(0) if match else raw
+
+
+def ai_extract_medicine(image_bytes: bytes) -> Optional[Dict[str, Any]]:
+    if openai_client is None:
+        return None
+    b64 = base64.b64encode(image_bytes).decode("utf-8")
+    prompt = """
+Extract only medicine-label information that is visibly present in this image.
+Return strict JSON with these keys:
+medicine_name, ingredient, strength, dosage_form, manufacturer, batch,
+mfg_date, exp_date, mrp, printed_use, confidence.
+Do not guess missing values. Use null for fields that are not visible.
+This is extraction, not medical diagnosis or authenticity verification.
+"""
+    try:
+        response = openai_client.responses.create(
+            model=OPENAI_MODEL,
             input=[
                 {
                     "role": "user",
                     "content": [
-                        {
-                            "type": "input_text",
-                            "text": prompt
-                        },
+                        {"type": "input_text", "text": prompt},
                         {
                             "type": "input_image",
-                            "image_url":
-                                "data:image/jpeg;base64,"
-                                + image_base64
-                        }
-                    ]
+                            "image_url": f"data:image/jpeg;base64,{b64}",
+                            "detail": "high",
+                        },
+                    ],
                 }
-            ]
+            ],
         )
+        text = response.output_text.strip()
+        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text).strip()
+        return json.loads(text)
+    except Exception:
+        return None
 
-    except Exception as e:
 
-        raise RuntimeError(
-            f"OpenAI API request failed: {e}"
-        )
-
-    result = response.output_text.strip()
-
-    # Remove markdown JSON fences
-    result = re.sub(
-        r"^```json\s*",
-        "",
-        result,
-        flags=re.IGNORECASE
+# -----------------------------------------------------------------------------
+# AI explanation / memory-aware agent
+# -----------------------------------------------------------------------------
+def generate_explanation(medicine: Dict[str, Any], memory_context: List[str]) -> str:
+    base = (
+        f"Medicine: {medicine.get('name', 'Unknown')}\n"
+        f"Ingredient: {medicine.get('ingredient', 'Not available')}\n"
+        f"General labeled use: {medicine.get('use', 'Not available')}\n"
+        f"Safety information: {medicine.get('warning', 'Not available')}"
     )
 
-    result = re.sub(
-        r"^```\s*",
-        "",
-        result
-    )
+    if openai_client is None:
+        return medicine.get("use", "No AI explanation is configured. Please use the product label and qualified professional guidance.")
 
-    result = re.sub(
-        r"\s*```$",
-        "",
-        result
-    )
+    memories = "\n".join(f"- {m}" for m in memory_context) if memory_context else "No prior memory is available."
+    prompt = f"""
+You are MediScan, a medicine-information assistant.
+Explain the supplied product information in plain language.
+Do not diagnose, prescribe, recommend a dose, or invent missing facts.
+Use the remembered context only to personalize communication style or refer to prior scans.
+Clearly say when a fact is unavailable.
 
-    result = result.strip()
+CURRENT PRODUCT:
+{base}
 
-    # Convert response to JSON
+RELEVANT LONG-TERM MEMORY:
+{memories}
+
+Write 4 short sections:
+1. What this product information says
+2. Why the user might care about the batch/expiry fields
+3. Safety notes from the supplied record
+4. Memory-aware note: mention a prior scan/preference only if the memory actually supports it
+"""
     try:
-
-        return json.loads(result)
-
-    except json.JSONDecodeError:
-
-        start = result.find("{")
-        end = result.rfind("}")
-
-        if start != -1 and end != -1:
-
-            json_text = result[
-                start:end + 1
-            ]
-
-            return json.loads(json_text)
-
-        raise RuntimeError(
-            "The AI returned an unexpected response format:\n\n"
-            + result
-        )
+        response = openai_client.responses.create(model=OPENAI_MODEL, input=prompt)
+        return response.output_text.strip()
+    except Exception:
+        return medicine.get("use", "AI explanation is temporarily unavailable.")
 
 
-# =========================================================
-# DISPLAY MEDICINE INFORMATION
-# =========================================================
+def answer_memory_question(question: str) -> str:
+    memories = recall_memories(question, limit=8)
+    st.session_state.last_memory_context = memories
+    if not memories:
+        return "I don't have a matching long-term memory for that question yet."
 
-def display_result(data):
+    if openai_client is None:
+        return "\n".join(f"• {m}" for m in memories)
 
-    st.divider()
+    context = "\n".join(f"- {m}" for m in memories)
+    prompt = f"""
+Answer the user's question using ONLY the retrieved MediScan memory below.
+Do not invent medicine facts. If the memory does not answer the question, say so.
+Do not diagnose or prescribe.
 
-    st.subheader(
-        "💊 Detected Medicine Information"
-    )
+Retrieved memory:
+{context}
 
-    def get_value(key):
-
-        value = data.get(
-            key,
-            "Not clearly visible"
-        )
-
-        if value is None:
-            return "Not clearly visible"
-
-        if str(value).strip() == "":
-            return "Not clearly visible"
-
-        return str(value)
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-
-        st.write("**💊 Medicine Name**")
-
-        st.info(
-            get_value("medicine_name")
-        )
-
-        st.write("**🧪 Active Ingredient**")
-
-        st.info(
-            get_value("active_ingredient")
-        )
-
-        st.write("**💊 Strength**")
-
-        st.info(
-            get_value("strength")
-        )
-
-        st.write("**💊 Dosage Form**")
-
-        st.info(
-            get_value("dosage_form")
-        )
-
-        st.write("**🏭 Manufacturer**")
-
-        st.info(
-            get_value("manufacturer")
-        )
-
-    with col2:
-
-        st.write("**📦 Batch Number**")
-
-        st.info(
-            get_value("batch_number")
-        )
-
-        st.write("**📅 Manufacturing Date**")
-
-        st.info(
-            get_value("manufacturing_date")
-        )
-
-        st.write("**📅 Expiry Date**")
-
-        st.info(
-            get_value("expiry_date")
-        )
-
-        st.write("**💰 MRP**")
-
-        st.info(
-            get_value("mrp")
-        )
-
-    st.subheader(
-        "📌 Information Printed on Package"
-    )
-
-    st.write(
-        get_value("general_use_printed")
-    )
-
-    st.subheader(
-        "🔍 Reading Confidence"
-    )
-
-    confidence = get_value(
-        "confidence"
-    )
-
-    if confidence.lower() == "high":
-
-        st.success(
-            "🟢 High confidence"
-        )
-
-    elif confidence.lower() == "medium":
-
-        st.warning(
-            "🟡 Medium confidence"
-        )
-
-    else:
-
-        st.warning(
-            "🔴 Low confidence"
-        )
-
-    st.divider()
-
-    st.info(
-        "ℹ️ Please verify the detected information "
-        "with the original medicine package."
-    )
+Question: {question}
+"""
+    try:
+        response = openai_client.responses.create(model=OPENAI_MODEL, input=prompt)
+        return response.output_text.strip()
+    except Exception:
+        return "\n".join(f"• {m}" for m in memories)
 
 
-# =========================================================
-# CAMERA
-# =========================================================
-
-st.divider()
-
-st.subheader(
-    "📷 Scan Medicine Strip"
+# -----------------------------------------------------------------------------
+# Header / hero
+# -----------------------------------------------------------------------------
+st.markdown(
+    """
+    <div class="hero">
+      <div class="eyebrow">MEDICINE INFORMATION + PERSISTENT MEMORY</div>
+      <h1>Scan. Remember. Understand.</h1>
+      <p>
+        MediScan turns a medicine scan into a continuing information workflow: capture the
+        available product details, retain useful context, and recall it in later interactions.
+      </p>
+      <span class="pill">QR / IMAGE</span>
+      <span class="pill">EXPIRY CHECK</span>
+      <span class="pill">AI EXPLANATION</span>
+      <span class="pill">HINDSIGHT MEMORY</span>
+    </div>
+    """,
+    unsafe_allow_html=True,
 )
 
-camera_photo = st.camera_input(
-    "Take a clear picture of the medicine strip"
+# Sidebar: configuration and judge demo controls
+with st.sidebar:
+    st.markdown("## 🧠 Memory Agent")
+    st.session_state.memory_profile = st.text_input(
+        "Demo profile ID",
+        value=st.session_state.memory_profile,
+        help="Use the same profile ID during the demo so Hindsight can recall earlier interactions.",
+    ).strip() or "demo-user-001"
+
+    if hindsight_ready:
+        st.success("Hindsight memory: connected")
+        st.caption(f"Bank: `{HINDSIGHT_BANK_ID}`")
+    else:
+        st.warning("Hindsight memory: not configured")
+        st.caption("Add HINDSIGHT_API_KEY and HINDSIGHT_BASE_URL to Streamlit secrets.")
+
+    if openai_client:
+        st.success(f"AI analysis: {OPENAI_MODEL}")
+    else:
+        st.info("AI image analysis is optional. Demo records still work.")
+
+    st.markdown("### Judge demo flow")
+    st.markdown("1. Scan **MED001** → retain memory")
+    st.markdown("2. Choose **Too technical** → retain preference")
+    st.markdown("3. Scan **MED002** → retain second interaction")
+    st.markdown("4. Ask: **What have I scanned before?**")
+    st.markdown("5. Show the recalled memories")
+
+    st.markdown("### Why Hindsight matters")
+    st.caption("Without memory, each scan is isolated. With memory, the agent can recall prior scan context and communication preferences.")
+
+# -----------------------------------------------------------------------------
+# Main input area
+# -----------------------------------------------------------------------------
+st.markdown("## 1. Scan or upload a medicine")
+left, right = st.columns(2)
+
+with left:
+    camera = st.camera_input("Take a photo of the QR code or medicine label")
+    if camera is not None:
+        camera_bytes = camera.getvalue()
+        qr = decode_qr(camera_bytes)
+        if qr:
+            st.session_state.last_qr = qr
+            st.success(f"QR detected: `{qr}`")
+        else:
+            st.info("No QR text detected. You can still use the image for AI label extraction.")
+        st.session_state.last_camera_bytes = camera_bytes
+
+with right:
+    upload = st.file_uploader(
+        "Upload a QR/medicine image",
+        type=["png", "jpg", "jpeg", "webp"],
+    )
+    if upload is not None:
+        upload_bytes = upload.getvalue()
+        qr = decode_qr(upload_bytes)
+        if qr:
+            st.session_state.last_qr = qr
+            st.success(f"QR detected: `{qr}`")
+        else:
+            st.info("No QR text detected in the uploaded image.")
+        st.session_state.last_upload_bytes = upload_bytes
+
+st.markdown("### Demo / fallback")
+d1, d2, d3, d4 = st.columns(4)
+with d1:
+    if st.button("Demo MED001", use_container_width=True):
+        st.session_state.last_qr = "MED001"
+with d2:
+    if st.button("Demo MED002", use_container_width=True):
+        st.session_state.last_qr = "MED002"
+with d3:
+    if st.button("Demo expired", use_container_width=True):
+        st.session_state.last_qr = "MED003"
+with d4:
+    manual = st.text_input("QR / ID", placeholder="MED001", label_visibility="collapsed")
+    if manual:
+        st.session_state.last_qr = manual
+
+# AI extraction button for image-only flow
+image_bytes_for_ai = st.session_state.get("last_upload_bytes") or st.session_state.get("last_camera_bytes")
+if image_bytes_for_ai and openai_client:
+    if st.button("🤖 Extract medicine details from this image", type="secondary"):
+        with st.spinner("Reading visible label information…"):
+            extracted = ai_extract_medicine(image_bytes_for_ai)
+        if extracted:
+            st.session_state.ai_extracted = extracted
+            st.success("Visible label information extracted. Review it before relying on it.")
+        else:
+            st.error("The image could not be reliably extracted. Try a clearer image.")
+
+if st.session_state.get("ai_extracted"):
+    with st.expander("AI-extracted fields", expanded=True):
+        st.json(st.session_state.ai_extracted)
+
+# -----------------------------------------------------------------------------
+# Resolve result
+# -----------------------------------------------------------------------------
+raw_id = st.session_state.get("last_qr", "")
+medicine_id = normalize_medicine_id(raw_id)
+medicine = MEDICINES.get(medicine_id)
+
+if medicine:
+    expiry_date = datetime.strptime(medicine["expiry"], "%Y-%m-%d").date()
+    expired = expiry_date < date.today()
+
+    result = dict(medicine)
+    result["id"] = medicine_id
+    result["status"] = "EXPIRED" if expired else "VALID"
+    st.session_state.last_result = result
+
+    # Retain scan event only once per profile/batch in this session.
+    event_key = f"{st.session_state.memory_profile}:{medicine_id}:{medicine['batch']}"
+    if event_key not in st.session_state.scan_history:
+        retained = retain_memory(
+            content=(
+                f"The user scanned medicine record {medicine_id}, named {medicine['name']}, "
+                f"batch {medicine['batch']}, manufacturer {medicine['manufacturer']}, "
+                f"manufacturing date {medicine['mfg']}, expiry date {medicine['expiry']}, "
+                f"dosage form {medicine['form']}. Record status at scan time: {result['status']}."
+            ),
+            context="Medicine scan event",
+        )
+        st.session_state.scan_history.append(event_key)
+        if retained:
+            st.toast("🧠 Scan context retained in Hindsight", icon="🧠")
+
+    st.divider()
+    st.markdown("## 2. Scan result")
+    if expired:
+        st.markdown(
+            f'<div class="danger"><b>🔴 EXPIRED RECORD</b><br>This demo record expired on {expiry_date.strftime("%d %b %Y")}.</div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            '<div class="success"><b>🟢 DATE CHECK PASSED</b><br>The recorded expiry date has not passed.</div>',
+            unsafe_allow_html=True,
+        )
+
+    st.markdown(f"# {medicine['name']}")
+    a, b, c = st.columns(3)
+    with a:
+        st.markdown("**Active ingredient**")
+        st.write(medicine["ingredient"])
+        st.markdown("**Manufacturer**")
+        st.write(medicine["manufacturer"])
+    with b:
+        st.markdown("**Manufacturing date**")
+        st.write(datetime.strptime(medicine["mfg"], "%Y-%m-%d").strftime("%d %b %Y"))
+        st.markdown("**Expiry date**")
+        st.write(expiry_date.strftime("%d %b %Y"))
+    with c:
+        st.markdown("**Batch number**")
+        st.write(medicine["batch"])
+        st.markdown("**Dosage form**")
+        st.write(medicine["form"])
+
+    st.markdown("### Product information")
+    st.info(medicine["use"])
+    st.markdown(f'<div class="warning"><b>⚠ Safety information</b><br>{medicine["warning"]}</div>', unsafe_allow_html=True)
+
+    # Memory-aware explanation
+    st.markdown("## 3. What changed because the agent remembers?")
+    memory_context = recall_memories(
+        f"previous medicine scans, explanation preferences, and context relevant to {medicine['name']}",
+        limit=5,
+    )
+    st.session_state.last_memory_context = memory_context
+
+    off, on = st.columns(2)
+    with off:
+        st.markdown('<div class="memory-card memory-off"><b>WITHOUT MEMORY</b><br><br>This interaction is treated as a new, isolated scan. The explanation uses only the current record.</div>', unsafe_allow_html=True)
+        st.caption("Generic context")
+        st.write(medicine["use"])
+    with on:
+        st.markdown('<div class="memory-card memory-on"><b>WITH HINDSIGHT</b><br><br>The agent recalls relevant prior scan context and can adapt the explanation to what it has learned.</div>', unsafe_allow_html=True)
+        if memory_context:
+            explanation = generate_explanation(medicine, memory_context)
+            st.write(explanation)
+        else:
+            st.caption("No matching long-term memory yet. Scan more than one medicine or save a preference to make the difference visible.")
+
+    # Explicit learning signal
+    st.markdown("### Teach the agent how you want explanations")
+    f1, f2, f3 = st.columns(3)
+    with f1:
+        if st.button("👍 Keep it like this", use_container_width=True):
+            if retain_memory("The user prefers the current concise explanation style.", "User feedback"):
+                st.success("Preference retained.")
+    with f2:
+        if st.button("🧾 More detailed", use_container_width=True):
+            if retain_memory("The user prefers more detailed explanations with structured sections.", "User feedback"):
+                st.success("Preference retained.")
+    with f3:
+        if st.button("🧠 More simple", use_container_width=True):
+            if retain_memory("The user prefers simpler, less technical explanations.", "User feedback"):
+                st.success("Preference retained.")
+
+    # Local cabinet for the current session
+    if st.button("➕ Add to My Medicines", type="primary"):
+        if medicine["batch"] not in [x["batch"] for x in st.session_state.cabinet]:
+            st.session_state.cabinet.append(medicine)
+            retain_memory(
+                f"The user saved {medicine['name']} (batch {medicine['batch']}) to My Medicines.",
+                "Medicine cabinet action",
+            )
+            st.success("Added to My Medicines and recorded in memory.")
+        else:
+            st.info("This medicine is already in the current session cabinet.")
+
+elif medicine_id:
+    st.warning("That medicine ID is not in the demo database. Try MED001, MED002, or MED003.")
+
+# -----------------------------------------------------------------------------
+# Memory assistant
+# -----------------------------------------------------------------------------
+st.divider()
+st.markdown("## 4. Ask MediScan about what it remembers")
+st.caption("This is the hackathon's key before/after interaction: ask about an earlier scan after the first interaction has been retained.")
+question = st.text_input(
+    "Memory question",
+    placeholder="What medicines have I scanned before?",
+)
+if st.button("Recall from Hindsight", type="primary", disabled=not bool(question.strip())):
+    with st.spinner("Recalling relevant memories…"):
+        answer = answer_memory_question(question.strip())
+    st.markdown('<div class="memory-card memory-on"><b>🧠 Hindsight recall</b></div>', unsafe_allow_html=True)
+    st.write(answer)
+
+if st.session_state.last_memory_context:
+    with st.expander("Show retrieved memory evidence"):
+        for idx, memory in enumerate(st.session_state.last_memory_context, 1):
+            st.markdown(f"**Memory {idx}**")
+            st.write(memory)
+
+# -----------------------------------------------------------------------------
+# My Medicines / workflow
+# -----------------------------------------------------------------------------
+st.divider()
+st.markdown("## 5. My Medicines")
+if st.session_state.cabinet:
+    for item in st.session_state.cabinet:
+        expiry = datetime.strptime(item["expiry"], "%Y-%m-%d").date()
+        status = "🔴 Expired" if expiry < date.today() else "🟢 Current"
+        st.markdown(
+            f"**{item['name']}** · {status} · Batch `{item['batch']}` · Expires {expiry.strftime('%d %b %Y')}"
+        )
+else:
+    st.caption("No medicines saved in this session yet.")
+
+st.divider()
+st.markdown("## How the agent works")
+q1, q2, q3, q4 = st.columns(4)
+with q1:
+    st.markdown('<div class="flow">01<br>SCAN</div>', unsafe_allow_html=True)
+    st.caption("QR or medicine image")
+with q2:
+    st.markdown('<div class="flow">02<br>PROCESS</div>', unsafe_allow_html=True)
+    st.caption("Extract available fields")
+with q3:
+    st.markdown('<div class="flow">03<br>RETAIN</div>', unsafe_allow_html=True)
+    st.caption("Hindsight stores useful context")
+with q4:
+    st.markdown('<div class="flow">04<br>RECALL</div>', unsafe_allow_html=True)
+    st.caption("Later interactions use memory")
+
+st.markdown("### Hackathon story in one sentence")
+st.info(
+    "A normal medicine scanner forgets every interaction; MediScan adds a persistent memory layer so the agent can remember prior scans and communication preferences, then use that context in later interactions."
 )
 
 st.caption(
-    "For best results, keep the printed side facing "
-    "the camera and use good lighting."
+    "Educational prototype. Demo medicine records are fictional. This application does not establish product authenticity, diagnose conditions, or replace a qualified healthcare professional."
 )
-
-
-# =========================================================
-# IMAGE UPLOAD
-# =========================================================
-
-st.subheader(
-    "🖼️ Or Upload a Medicine Image"
-)
-
-uploaded_photo = st.file_uploader(
-    "Choose a medicine image",
-    type=[
-        "jpg",
-        "jpeg",
-        "png"
-    ]
-)
-
-
-# =========================================================
-# SELECT IMAGE
-# =========================================================
-
-photo = camera_photo or uploaded_photo
-
-
-# =========================================================
-# PROCESS IMAGE
-# =========================================================
-
-if photo:
-
-    try:
-
-        image = Image.open(photo)
-
-        image = image.convert("RGB")
-
-    except Exception:
-
-        st.error(
-            "❌ Unable to open this image."
-        )
-
-        st.stop()
-
-    st.image(
-        image,
-        caption="Medicine image",
-        use_container_width=True
-    )
-
-    # QR Detection
-    qr_data = detect_qr(image)
-
-    if qr_data:
-
-        st.success(
-            f"📱 QR Code detected: {qr_data}"
-        )
-
-    # AI Analysis
-    with st.spinner(
-        "🤖 AI is reading the medicine package..."
-    ):
-
-        try:
-
-            medicine_data = analyze_medicine_image(
-                image
-            )
-
-            display_result(
-                medicine_data
-            )
-
-        except json.JSONDecodeError as e:
-
-            st.error(
-                "❌ The AI returned invalid JSON."
-            )
-
-            st.code(
-                str(e),
-                language="text"
-            )
-
-        except Exception as e:
-
-            st.error(
-                "❌ Unable to analyze the image."
-            )
-
-            st.write(
-                "Here is the actual error:"
-            )
-
-            st.code(
-                str(e),
-                language="text"
-            )
