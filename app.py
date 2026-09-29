@@ -1,111 +1,160 @@
-    memory_context = recall_memories(
-        f"previous medicine scans, explanation preferences, and context relevant to {medicine['name']}",
-        limit=5,
-    )
-    st.session_state.last_memory_context = memory_context
-
-    off, on = st.columns(2)
-    with off:
-        st.markdown('<div class="memory-card memory-off"><b>WITHOUT MEMORY</b><br><br>This interaction is treated as a new, isolated scan. The explanation uses only the current record.</div>', unsafe_allow_html=True)
-        st.caption("Generic context")
-        st.write(medicine["use"])
-    with on:
-        st.markdown('<div class="memory-card memory-on"><b>WITH HINDSIGHT</b><br><br>The agent recalls relevant prior scan context and can adapt the explanation to what it has learned.</div>', unsafe_allow_html=True)
-        if memory_context:
-            explanation = generate_explanation(medicine, memory_context)
-            st.write(explanation)
-        else:
-            st.caption("No matching long-term memory yet. Scan more than one medicine or save a preference to make the difference visible.")
-
-    # Explicit learning signal
-    st.markdown("### Teach the agent how you want explanations")
-    f1, f2, f3 = st.columns(3)
-    with f1:
-        if st.button("👍 Keep it like this", use_container_width=True):
-            if retain_memory("The user prefers the current concise explanation style.", "User feedback"):
-                st.success("Preference retained.")
-    with f2:
-        if st.button("🧾 More detailed", use_container_width=True):
-            if retain_memory("The user prefers more detailed explanations with structured sections.", "User feedback"):
-                st.success("Preference retained.")
-    with f3:
-        if st.button("🧠 More simple", use_container_width=True):
-            if retain_memory("The user prefers simpler, less technical explanations.", "User feedback"):
-                st.success("Preference retained.")
-
-    # Local cabinet for the current session
-    if st.button("➕ Add to My Medicines", type="primary"):
-        if medicine["batch"] not in [x["batch"] for x in st.session_state.cabinet]:
-            st.session_state.cabinet.append(medicine)
-            retain_memory(
-                f"The user saved {medicine['name']} (batch {medicine['batch']}) to My Medicines.",
-                "Medicine cabinet action",
-            )
-            st.success("Added to My Medicines and recorded in memory.")
-        else:
-            st.info("This medicine is already in the current session cabinet.")
-
-elif medicine_id:
-    st.warning("That medicine ID is not in the demo database. Try MED001, MED002, or MED003.")
 
 # -----------------------------------------------------------------------------
-# Memory assistant
+# Session state
 # -----------------------------------------------------------------------------
-st.divider()
-st.markdown("## 4. Ask MediScan about what it remembers")
-st.caption("This is the hackathon's key before/after interaction: ask about an earlier scan after the first interaction has been retained.")
-question = st.text_input(
-    "Memory question",
-    placeholder="What medicines have I scanned before?",
+if "cabinet" not in st.session_state:
+    st.session_state.cabinet = []
+if "scan_history" not in st.session_state:
+    st.session_state.scan_history = []
+if "last_result" not in st.session_state:
+    st.session_state.last_result = None
+if "last_memory_context" not in st.session_state:
+    st.session_state.last_memory_context = []
+if "memory_profile" not in st.session_state:
+    st.session_state.memory_profile = "demo-user-001"
+
+# -----------------------------------------------------------------------------
+# Config helpers
+# -----------------------------------------------------------------------------
+def secret(name: str, default: str = "") -> str:
+    try:
+        value = st.secrets.get(name, None)
+        if value is not None:
+            return str(value).strip()
+    except Exception:
+        pass
+    return str(os.getenv(name, default) or default).strip()
+
+
+OPENAI_API_KEY = secret("OPENAI_API_KEY")
+OPENAI_MODEL = secret("OPENAI_MODEL", "gpt-5")
+HINDSIGHT_API_KEY = secret("HINDSIGHT_API_KEY")
+HINDSIGHT_BASE_URL = secret(
+    "HINDSIGHT_BASE_URL",
+    "https://api.hindsight.vectorize.io",
 )
-if st.button("Recall from Hindsight", type="primary", disabled=not bool(question.strip())):
-    with st.spinner("Recalling relevant memories…"):
-        answer = answer_memory_question(question.strip())
-    st.markdown('<div class="memory-card memory-on"><b>🧠 Hindsight recall</b></div>', unsafe_allow_html=True)
-    st.write(answer)
+HINDSIGHT_BANK_ID = secret(
+    "HINDSIGHT_BANK_ID",
+    "mediscan-memory-agent",
+)
 
-if st.session_state.last_memory_context:
-    with st.expander("Show retrieved memory evidence"):
-        for idx, memory in enumerate(st.session_state.last_memory_context, 1):
-            st.markdown(f"**Memory {idx}**")
-            st.write(memory)
 
-# -----------------------------------------------------------------------------
-# My Medicines / workflow
-# -----------------------------------------------------------------------------
-st.divider()
-st.markdown("## 5. My Medicines")
-if st.session_state.cabinet:
-    for item in st.session_state.cabinet:
-        expiry = datetime.strptime(item["expiry"], "%Y-%m-%d").date()
-        status = "🔴 Expired" if expiry < date.today() else "🟢 Current"
-        st.markdown(
-            f"**{item['name']}** · {status} · Batch `{item['batch']}` · Expires {expiry.strftime('%d %b %Y')}"
+@st.cache_resource(show_spinner=False)
+def get_openai_client():
+    if not OPENAI_API_KEY or OpenAI is None:
+        return None
+    try:
+        return OpenAI(api_key=OPENAI_API_KEY)
+    except Exception:
+        return None
+
+
+@st.cache_resource(show_spinner=False)
+def get_hindsight_client():
+    if not HINDSIGHT_API_KEY:
+        st.session_state["hindsight_error"] = (
+            "HINDSIGHT_API_KEY is missing. Add it to Streamlit Secrets."
         )
-else:
-    st.caption("No medicines saved in this session yet.")
+        return None
 
-st.divider()
-st.markdown("## How the agent works")
-q1, q2, q3, q4 = st.columns(4)
-with q1:
-    st.markdown('<div class="flow">01<br>SCAN</div>', unsafe_allow_html=True)
-    st.caption("QR or medicine image")
-with q2:
-    st.markdown('<div class="flow">02<br>PROCESS</div>', unsafe_allow_html=True)
-    st.caption("Extract available fields")
-with q3:
-    st.markdown('<div class="flow">03<br>RETAIN</div>', unsafe_allow_html=True)
-    st.caption("Hindsight stores useful context")
-with q4:
-    st.markdown('<div class="flow">04<br>RECALL</div>', unsafe_allow_html=True)
-    st.caption("Later interactions use memory")
+    if Hindsight is None:
+        st.session_state["hindsight_error"] = (
+            "The hindsight-client package is not installed. "
+            "Add hindsight-client to requirements.txt and redeploy."
+        )
+        return None
 
-st.markdown("### Hackathon story in one sentence")
-st.info(
-    "A normal medicine scanner forgets every interaction; MediScan adds a persistent memory layer so the agent can remember prior scans and communication preferences, then use that context in later interactions."
-)
+    try:
+        client = Hindsight(
+            base_url=HINDSIGHT_BASE_URL,
+            api_key=HINDSIGHT_API_KEY,
+        )
+        st.session_state["hindsight_error"] = ""
+        return client
+    except Exception as e:
+        st.session_state["hindsight_error"] = (
+            f"{type(e).__name__}: {e}"
+        )
+        return None
 
-st.caption(
-    "Educational prototype. Demo medicine records are fictional. This application does not establish product authenticity, diagnose conditions, or replace a qualified healthcare professional."
-)
+
+def ensure_hindsight_bank(client) -> bool:
+    if client is None:
+        return False
+    try:
+        client.create_bank(
+            bank_id=HINDSIGHT_BANK_ID,
+            name="MediScan Medicine Memory Agent",
+            background=(
+                "A medicine information assistant that remembers prior scan context, "
+                "user explanation preferences, and previous medicine-information interactions. "
+                "It must not diagnose, prescribe, or invent medicine facts."
+            ),
+            disposition={"skepticism": 4, "literalism": 5, "empathy": 4},
+        )
+    except Exception:
+        # A 409/already-existing bank is expected on subsequent app starts.
+        pass
+    return True
+
+
+hindsight = get_hindsight_client()
+hindsight_ready = ensure_hindsight_bank(hindsight)
+openai_client = get_openai_client()
+
+# -----------------------------------------------------------------------------
+# Hindsight memory layer
+# -----------------------------------------------------------------------------
+def retain_memory(content: str, context: str = "MediScan interaction") -> bool:
+    if not hindsight_ready or hindsight is None:
+        return False
+    try:
+        hindsight.retain(
+            bank_id=HINDSIGHT_BANK_ID,
+            content=f"Profile: {st.session_state.memory_profile}. {content}",
+            context=context,
+            metadata={
+                "app": "mediscan",
+                "profile": st.session_state.memory_profile,
+            },
+        )
+        return True
+    except Exception as e:
+        st.session_state["hindsight_error"] = (
+            f"Retain failed: {type(e).__name__}: {e}"
+        )
+        return False
+
+
+def recall_memories(query: str, limit: int = 6) -> List[str]:
+    if not hindsight_ready or hindsight is None:
+        return []
+    try:
+        result = hindsight.recall(
+            bank_id=HINDSIGHT_BANK_ID,
+            query=f"Profile: {st.session_state.memory_profile}. {query}",
+            max_tokens=2500,
+            budget="low",
+        )
+        memories = []
+        for item in result.results[:limit]:
+            text = getattr(item, "text", None)
+            if text:
+                memories.append(text)
+        return memories
+    except Exception as e:
+        st.session_state["hindsight_error"] = (
+            f"Recall failed: {type(e).__name__}: {e}"
+        )
+        return []
+
+
+# -----------------------------------------------------------------------------
+# QR / image helpers
+# -----------------------------------------------------------------------------
+def decode_qr(image_bytes: bytes) -> Optional[str]:
+    try:
+        arr = np.frombuffer(image_bytes, np.uint8)
+        image = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if image is None:
+            return None
