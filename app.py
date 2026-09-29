@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import json
 import os
 import re
@@ -290,16 +291,27 @@ def normalize_medicine_id(raw: str) -> str:
 
 
 def ai_extract_medicine(image_bytes: bytes) -> Optional[Dict[str, Any]]:
+    """Extract visible medicine-strip/label fields from an image.
+
+    This is intentionally separate from QR decoding: a normal medicine strip may
+    contain no QR code at all, so image extraction should still work.
+    """
     if openai_client is None:
         return None
+
     b64 = base64.b64encode(image_bytes).decode("utf-8")
     prompt = """
-Extract only medicine-label information that is visibly present in this image.
-Return strict JSON with these keys:
+Read the medicine strip, box, bottle label, or prescription label in this image.
+Extract ONLY information that is visibly printed. Do not guess or fill missing values.
+Return strict JSON with exactly these keys:
 medicine_name, ingredient, strength, dosage_form, manufacturer, batch,
 mfg_date, exp_date, mrp, printed_use, confidence.
-Do not guess missing values. Use null for fields that are not visible.
-This is extraction, not medical diagnosis or authenticity verification.
+
+Important: This may be a medicine strip with NO QR code. Read the printed text directly.
+Preserve the medicine name and strength exactly when visible. Dates may be printed as
+MM/YYYY, MM-YYYY, DD/MM/YYYY, DD-MM-YYYY, or similar; preserve the visible date text.
+Use null when a field is not visible. This is extraction, not medical diagnosis,
+authenticity verification, or a recommendation.
 """
     try:
         response = openai_client.responses.create(
@@ -320,9 +332,59 @@ This is extraction, not medical diagnosis or authenticity verification.
         )
         text = response.output_text.strip()
         text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text).strip()
-        return json.loads(text)
-    except Exception:
+        data = json.loads(text)
+        return data if isinstance(data, dict) else None
+    except Exception as e:
+        st.session_state["image_extract_error"] = f"{type(e).__name__}: {e}"
         return None
+
+
+def parse_label_date(value: Any) -> Optional[date]:
+    """Parse common printed medicine dates without assuming a missing date."""
+    if not value:
+        return None
+    text = str(value).strip()
+    formats = (
+        "%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%m/%d/%Y",
+        "%d-%b-%Y", "%d/%b/%Y", "%b-%Y", "%b/%Y", "%m-%Y", "%m/%Y",
+    )
+    for fmt in formats:
+        try:
+            parsed = datetime.strptime(text, fmt)
+            # For month-only expiry labels, use the last day of that month.
+            if fmt in ("%b-%Y", "%b/%Y", "%m-%Y", "%m/%Y"):
+                import calendar
+                return date(parsed.year, parsed.month, calendar.monthrange(parsed.year, parsed.month)[1])
+            return parsed.date()
+        except ValueError:
+            continue
+    return None
+
+
+def build_image_medicine(extracted: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Convert AI-extracted fields into the same display shape as demo records."""
+    name = extracted.get("medicine_name")
+    if not name:
+        return None
+
+    ingredient = extracted.get("ingredient") or "Not visible"
+    strength = extracted.get("strength")
+    if strength and str(strength).strip().lower() not in str(ingredient).lower():
+        ingredient = f"{ingredient} ({strength})"
+
+    return {
+        "name": str(name).strip(),
+        "ingredient": str(ingredient),
+        "manufacturer": str(extracted.get("manufacturer") or "Not visible"),
+        "mfg": str(extracted.get("mfg_date") or "Not visible"),
+        "expiry": str(extracted.get("exp_date") or "Not visible"),
+        "batch": str(extracted.get("batch") or "Not visible"),
+        "form": str(extracted.get("dosage_form") or "Not visible"),
+        "use": str(extracted.get("printed_use") or "No labeled use was clearly visible in the image."),
+        "warning": "Image-extracted information is based only on visible printed text. Verify the physical label and use professional guidance for medical decisions.",
+        "source": "image",
+        "confidence": extracted.get("confidence"),
+    }
 
 
 # -----------------------------------------------------------------------------
@@ -478,12 +540,14 @@ with left:
     if camera is not None:
         camera_bytes = camera.getvalue()
         qr = decode_qr(camera_bytes)
+        st.session_state.last_camera_bytes = camera_bytes
+        st.session_state.image_source = "camera"
         if qr:
             st.session_state.last_qr = qr
             st.success(f"QR detected: `{qr}`")
         else:
-            st.info("No QR text detected. You can still use the image for AI label extraction.")
-        st.session_state.last_camera_bytes = camera_bytes
+            st.session_state.last_qr = ""
+            st.info("No QR code found — automatically reading the printed medicine label instead.")
 
 with right:
     upload = st.file_uploader(
@@ -493,12 +557,29 @@ with right:
     if upload is not None:
         upload_bytes = upload.getvalue()
         qr = decode_qr(upload_bytes)
+        st.session_state.last_upload_bytes = upload_bytes
+        st.session_state.image_source = "upload"
         if qr:
             st.session_state.last_qr = qr
             st.success(f"QR detected: `{qr}`")
         else:
-            st.info("No QR text detected in the uploaded image.")
-        st.session_state.last_upload_bytes = upload_bytes
+            st.session_state.last_qr = ""
+            st.info("No QR code found — automatically reading the printed medicine label instead.")
+
+# If no QR was found, automatically run image extraction once per image.
+# This makes ordinary medicine strips work without requiring a QR code.
+image_bytes_for_ai = st.session_state.get("last_upload_bytes") or st.session_state.get("last_camera_bytes")
+if image_bytes_for_ai and openai_client and not st.session_state.get("last_qr"):
+    image_hash = hashlib.sha256(image_bytes_for_ai).hexdigest()
+    if st.session_state.get("ai_extracted_hash") != image_hash:
+        with st.spinner("Reading the printed medicine label…"):
+            extracted = ai_extract_medicine(image_bytes_for_ai)
+        st.session_state["ai_extracted_hash"] = image_hash
+        st.session_state["ai_extracted"] = extracted
+        if extracted:
+            st.success("Medicine label read successfully — no QR code was needed.")
+        else:
+            st.error("The medicine label could not be read reliably. Try a clearer, closer image.")
 
 st.markdown("### Demo / fallback")
 d1, d2, d3, d4 = st.columns(4)
@@ -516,21 +597,13 @@ with d4:
     if manual:
         st.session_state.last_qr = manual
 
-# AI extraction button for image-only flow
-image_bytes_for_ai = st.session_state.get("last_upload_bytes") or st.session_state.get("last_camera_bytes")
-if image_bytes_for_ai and openai_client:
-    if st.button("🤖 Extract medicine details from this image", type="secondary"):
-        with st.spinner("Reading visible label information…"):
-            extracted = ai_extract_medicine(image_bytes_for_ai)
-        if extracted:
-            st.session_state.ai_extracted = extracted
-            st.success("Visible label information extracted. Review it before relying on it.")
-        else:
-            st.error("The image could not be reliably extracted. Try a clearer image.")
-
 if st.session_state.get("ai_extracted"):
     with st.expander("AI-extracted fields", expanded=True):
         st.json(st.session_state.ai_extracted)
+
+if st.session_state.get("image_extract_error"):
+    with st.expander("Image extraction diagnostic"):
+        st.code(st.session_state["image_extract_error"])
 
 # -----------------------------------------------------------------------------
 # Resolve result
@@ -539,9 +612,15 @@ raw_id = st.session_state.get("last_qr", "")
 medicine_id = normalize_medicine_id(raw_id)
 medicine = MEDICINES.get(medicine_id)
 
+# If there is no QR/demo ID, use the medicine extracted from the image.
+if not medicine and st.session_state.get("ai_extracted"):
+    medicine = build_image_medicine(st.session_state["ai_extracted"])
+    if medicine:
+        medicine_id = "IMAGE-" + hashlib.sha1(medicine["name"].encode("utf-8")).hexdigest()[:8].upper()
+
 if medicine:
-    expiry_date = datetime.strptime(medicine["expiry"], "%Y-%m-%d").date()
-    expired = expiry_date < date.today()
+    expiry_date = parse_label_date(medicine.get("expiry"))
+    expired = expiry_date is not None and expiry_date < date.today()
 
     result = dict(medicine)
     result["id"] = medicine_id
@@ -566,16 +645,18 @@ if medicine:
 
     st.divider()
     st.markdown("## 2. Scan result")
-    if expired:
+    if expiry_date is not None and expired:
         st.markdown(
-            f'<div class="danger"><b>🔴 EXPIRED RECORD</b><br>This demo record expired on {expiry_date.strftime("%d %b %Y")}.</div>',
+            f'<div class="danger"><b>🔴 EXPIRED RECORD</b><br>The visible expiry date is {expiry_date.strftime("%d %b %Y")}.</div>',
             unsafe_allow_html=True,
         )
-    else:
+    elif expiry_date is not None:
         st.markdown(
             '<div class="success"><b>🟢 DATE CHECK PASSED</b><br>The recorded expiry date has not passed.</div>',
             unsafe_allow_html=True,
         )
+    else:
+        st.info("Expiry date was not clearly available in the image, so no expiry status is inferred.")
 
     st.markdown(f"# {medicine['name']}")
     a, b, c = st.columns(3)
@@ -586,14 +667,18 @@ if medicine:
         st.write(medicine["manufacturer"])
     with b:
         st.markdown("**Manufacturing date**")
-        st.write(datetime.strptime(medicine["mfg"], "%Y-%m-%d").strftime("%d %b %Y"))
+        mfg_date = parse_label_date(medicine.get("mfg"))
+        st.write(mfg_date.strftime("%d %b %Y") if mfg_date else medicine.get("mfg", "Not visible"))
         st.markdown("**Expiry date**")
-        st.write(expiry_date.strftime("%d %b %Y"))
+        st.write(expiry_date.strftime("%d %b %Y") if expiry_date else medicine.get("expiry", "Not visible"))
     with c:
         st.markdown("**Batch number**")
         st.write(medicine["batch"])
         st.markdown("**Dosage form**")
         st.write(medicine["form"])
+
+    if medicine.get("source") == "image":
+        st.caption("📷 Details below were extracted from visible text in the uploaded medicine image. Verify them against the physical pack.")
 
     st.markdown("### Product information")
     st.info(medicine["use"])
@@ -680,10 +765,15 @@ st.divider()
 st.markdown("## 5. My Medicines")
 if st.session_state.cabinet:
     for item in st.session_state.cabinet:
-        expiry = datetime.strptime(item["expiry"], "%Y-%m-%d").date()
-        status = "🔴 Expired" if expiry < date.today() else "🟢 Current"
+        expiry = parse_label_date(item.get("expiry"))
+        if expiry is None:
+            status = "⚪ Expiry not available"
+            expiry_text = str(item.get("expiry", "Not visible"))
+        else:
+            status = "🔴 Expired" if expiry < date.today() else "🟢 Current"
+            expiry_text = expiry.strftime("%d %b %Y")
         st.markdown(
-            f"**{item['name']}** · {status} · Batch `{item['batch']}` · Expires {expiry.strftime('%d %b %Y')}"
+            f"**{item['name']}** · {status} · Batch `{item['batch']}` · Expires {expiry_text}"
         )
 else:
     st.caption("No medicines saved in this session yet.")
