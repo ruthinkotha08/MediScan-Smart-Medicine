@@ -125,6 +125,7 @@ def secret(name: str, default: str = "") -> str:
 
 OPENAI_API_KEY = secret("OPENAI_API_KEY")
 OPENAI_MODEL = secret("OPENAI_MODEL", "gpt-5")
+VISION_MODEL = secret("VISION_MODEL", "gpt-4o-mini")
 HINDSIGHT_API_KEY = secret("HINDSIGHT_API_KEY")
 HINDSIGHT_BASE_URL = secret(
     "HINDSIGHT_BASE_URL",
@@ -274,6 +275,251 @@ def recall_memories(query: str, limit: int = 6) -> List[str]:
 def decode_qr(image_bytes: bytes) -> Optional[str]:
     try:
         arr = np.frombuffer(image_bytes, np.uint8)
+        image = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if image is None:
+            return None
+        detector = cv2.QRCodeDetector()
+        data, _, _ = detector.detectAndDecode(image)
+        return data.strip() if data else None
+    except Exception:
+        return None
+
+
+def normalize_medicine_id(raw: str) -> str:
+    raw = (raw or "").strip().upper()
+    match = re.search(r"MED\d{3}", raw)
+    return match.group(0) if match else raw
+
+
+def prepare_medicine_image(image_bytes: bytes) -> bytes:
+    """Upscale and mildly enhance small medicine-strip photos before vision analysis."""
+    try:
+        arr = np.frombuffer(image_bytes, np.uint8)
+        image = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if image is None:
+            return image_bytes
+        h, w = image.shape[:2]
+        scale = 4 if max(h, w) < 1000 else 2
+        enlarged = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        lab = cv2.cvtColor(enlarged, cv2.COLOR_BGR2LAB)
+        l_channel, a_channel, b_channel = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        l_channel = clahe.apply(l_channel)
+        enhanced = cv2.cvtColor(cv2.merge((l_channel, a_channel, b_channel)), cv2.COLOR_LAB2BGR)
+        blurred = cv2.GaussianBlur(enhanced, (0, 0), 1.0)
+        sharpened = cv2.addWeighted(enhanced, 1.35, blurred, -0.35, 0)
+        ok, encoded = cv2.imencode('.jpg', sharpened, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+        return encoded.tobytes() if ok else image_bytes
+    except Exception:
+        return image_bytes
+
+
+def _parse_model_json(text: str) -> Optional[Dict[str, Any]]:
+    """Parse JSON even if the model adds a short explanation or code fence."""
+    cleaned = (text or '').strip()
+    cleaned = re.sub(r'^```(?:json)?\s*', '', cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r'\s*```$', '', cleaned).strip()
+    try:
+        value = json.loads(cleaned)
+        return value if isinstance(value, dict) else None
+    except json.JSONDecodeError:
+        match = re.search(r'\{.*\}', cleaned, flags=re.DOTALL)
+        if not match:
+            return None
+        try:
+            value = json.loads(match.group(0))
+            return value if isinstance(value, dict) else None
+        except json.JSONDecodeError:
+            return None
+
+
+def make_image_variants(image_bytes: bytes) -> List[bytes]:
+    """Create several readable views so the vision model can handle labels with hands/background."""
+    variants: List[bytes] = [image_bytes]
+    try:
+        arr = np.frombuffer(image_bytes, np.uint8)
+        image = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if image is None:
+            return variants
+        h, w = image.shape[:2]
+
+        # Main enhanced full image.
+        variants.append(prepare_medicine_image(image_bytes))
+
+        # Center/lower package crop: useful when fingers/background occupy the edges.
+        x1, x2 = int(w * 0.08), int(w * 0.94)
+        y1, y2 = int(h * 0.38), int(h * 0.92)
+        crop = image[y1:y2, x1:x2]
+        if crop.size:
+            crop = cv2.resize(crop, None, fx=2.5, fy=2.5, interpolation=cv2.INTER_CUBIC)
+            lab = cv2.cvtColor(crop, cv2.COLOR_BGR2LAB)
+            l, a, b = cv2.split(lab)
+            l = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8)).apply(l)
+            crop = cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2BGR)
+            ok, enc = cv2.imencode('.jpg', crop, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+            if ok:
+                variants.append(enc.tobytes())
+
+        # Upper package crop: catches large brand/product names.
+        y1, y2 = int(h * 0.40), int(h * 0.78)
+        crop2 = image[y1:y2, int(w * 0.15):int(w * 0.95)]
+        if crop2.size:
+            crop2 = cv2.resize(crop2, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
+            ok, enc = cv2.imencode('.jpg', crop2, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+            if ok:
+                variants.append(enc.tobytes())
+    except Exception:
+        pass
+    return variants
+
+
+def _vision_request(prompt: str, image_bytes_list: List[bytes]) -> str:
+    """Send several image views to the vision model and return its text response."""
+    content = [{'type': 'input_text', 'text': prompt}]
+    for b in image_bytes_list:
+        b64 = base64.b64encode(b).decode('utf-8')
+        content.append({
+            'type': 'input_image',
+            'image_url': f'data:image/jpeg;base64,{b64}',
+            'detail': 'high',
+        })
+    response = openai_client.responses.create(
+        model=VISION_MODEL,
+        input=[{'role': 'user', 'content': content}],
+    )
+    return (response.output_text or '').strip()
+
+
+def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
+    data = _parse_model_json(text)
+    if isinstance(data, dict):
+        return data
+    return None
+
+
+def ai_extract_medicine(image_bytes: bytes) -> Optional[Dict[str, Any]]:
+    """Read a medicine label using multiple image views and a non-strict fallback."""
+    if openai_client is None:
+        st.session_state['image_extract_error'] = 'OPENAI_API_KEY is missing or the OpenAI client could not be created.'
+        return None
+
+    variants = make_image_variants(image_bytes)
+    prompt = """
+Read the medicine package/strip shown in the images. This is an OCR-style
+medicine-label task. Do NOT diagnose, prescribe, or invent facts.
+
+The large brand/product name is the highest priority. Read it even if some
+small text is blurry. You may combine clearly readable text from the different
+views. If a field is not readable, use null rather than guessing.
+
+Return ONLY one JSON object with these keys:
+medicine_name, ingredient, strength, dosage_form, manufacturer, batch,
+mfg_date, exp_date, mrp, printed_use, confidence
+
+For confidence use high, medium, or low. The medicine name can be returned
+when it is clearly visible even if other fields are missing.
+"""
+    try:
+        raw = _vision_request(prompt, variants[:4])
+        data = _extract_json_object(raw)
+
+        # Fallback: ask for plain text if strict JSON was not produced.
+        if not data:
+            fallback_prompt = """
+Read this medicine package carefully. Return ONLY plain text in this exact form:
+Medicine name: ...
+Ingredient: ...
+Strength: ...
+Dosage form: ...
+Manufacturer: ...
+Batch: ...
+Manufacturing date: ...
+Expiry date: ...
+MRP: ...
+Printed use: ...
+Confidence: high/medium/low
+
+Do not guess unreadable values. The most important task is to identify the
+large printed medicine/product name exactly as visible.
+"""
+            raw2 = _vision_request(fallback_prompt, variants[:4])
+            lines = {}
+            for line in raw2.splitlines():
+                if ':' in line:
+                    k, v = line.split(':', 1)
+                    lines[k.strip().lower()] = v.strip()
+            data = {
+                'medicine_name': lines.get('medicine name'),
+                'ingredient': lines.get('ingredient'),
+                'strength': lines.get('strength'),
+                'dosage_form': lines.get('dosage form'),
+                'manufacturer': lines.get('manufacturer'),
+                'batch': lines.get('batch'),
+                'mfg_date': lines.get('manufacturing date'),
+                'exp_date': lines.get('expiry date'),
+                'mrp': lines.get('mrp'),
+                'printed_use': lines.get('printed use'),
+                'confidence': lines.get('confidence'),
+            }
+
+        medicine_name = str(data.get('medicine_name') or '').strip()
+        if not medicine_name or medicine_name.lower() in {'null', 'none', 'unknown', 'not readable'}:
+            st.session_state['image_extract_error'] = (
+                'The vision model responded, but it did not return a readable medicine name. '
+                f'Vision model: {VISION_MODEL}. Raw response: {raw[:1200] if "raw" in locals() else "(none)"}'
+            )
+            return None
+
+        keys = (
+            'medicine_name', 'ingredient', 'strength', 'dosage_form', 'manufacturer',
+            'batch', 'mfg_date', 'exp_date', 'mrp', 'printed_use', 'confidence'
+        )
+        return {key: data.get(key) for key in keys}
+    except Exception as e:
+        st.session_state['image_extract_error'] = f'{type(e).__name__}: {e}'
+        return None
+
+def parse_label_date(value: Any) -> Optional[date]:
+    """Parse common printed medicine dates without assuming a missing date."""
+    if not value:
+        return None
+    text = str(value).strip()
+    formats = (
+        "%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%m/%d/%Y",
+        "%d-%b-%Y", "%d/%b/%Y", "%b-%Y", "%b/%Y", "%m-%Y", "%m/%Y",
+    )
+    for fmt in formats:
+        try:
+            parsed = datetime.strptime(text, fmt)
+            # For month-only expiry labels, use the last day of that month.
+            if fmt in ("%b-%Y", "%b/%Y", "%m-%Y", "%m/%Y"):
+                import calendar
+                return date(parsed.year, parsed.month, calendar.monthrange(parsed.year, parsed.month)[1])
+            return parsed.date()
+        except ValueError:
+            continue
+    return None
+
+
+def build_image_medicine(extracted: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Convert AI-extracted fields into the same display shape as demo records."""
+    name = extracted.get("medicine_name")
+    if not name:
+        return None
+
+    ingredient = extracted.get("ingredient") or "Not visible"
+    strength = extracted.get("strength")
+    if strength and str(strength).strip().lower() not in str(ingredient).lower():
+        ingredient = f"{ingredient} ({strength})"
+
+    return {
+        "name": str(name).strip(),
+        "ingredient": str(ingredient),
+        "manufacturer": str(extracted.get("manufacturer") or "Not visible"),
+        "mfg": str(extracted.get("mfg_date") or "Not visible"),
+        "expiry": str(extracted.get("exp_date") or "Not visible"),
+        "batch": str(extracted.get("batch") or "Not visible"),
+        "form": stt8)
         image = cv2.imdecode(arr, cv2.IMREAD_COLOR)
         if image is None:
             return None
